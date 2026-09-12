@@ -1,0 +1,182 @@
+# 🔊 Sonar Station — LOFAR / DEMON
+
+> **A real-time acoustic analysis workstation for anything that makes sound —  
+> drones, aircraft, helicopters, ships, HVAC, engines, motors, appliances, wildlife.**
+
+This is not submarine software. The techniques inside — LOFAR and DEMON — were developed for naval sonar, but they work on *any* acoustic signal that carries rotating machinery or periodic structure. If it spins, beats, hums, or pulses, this tool can see it.
+
+It's for anyone who'd rather see a sound than just hear it: hobbyists tracking drones overhead, engineers listening for a bearing that's about to fail, plane-spotters curious what just flew over, or anyone who wants a real sonar waterfall running on their own laptop. It's one file, no build step, no framework underneath the GUI — start to finish, you can read the whole thing in an afternoon if you want to know exactly how it works.
+
+![Sonar Station — LOFAR and DEMON waterfalls](images/sonar_station_2026-09-12_21-20-46.png)
+
+---
+
+## What It Does
+
+`sonar_station.py` is a single-file Python desktop application that gives you two live waterfall displays and a configurable bandpass monitor:
+
+| Panel | Technique | What It Reveals |
+|---|---|---|
+| **LOFAR** | Short-time Fourier transform, normalized | Narrowband tonals — motor frequencies, resonances, structural vibrations |
+| **DEMON** | Envelope demodulation of a carrier band | Shaft rate, blade rate, and their harmonics |
+
+Both displays update in real time from a microphone or a WAV file. You can zoom into any frequency band with the scroll wheel, and the bandpass reticule lets you listen to any slice of the spectrum through your speakers.
+
+---
+
+## Installation
+
+```bash
+pip install PyQt6 pyqtgraph sounddevice numpy scipy pyfftw
+pip install numba  # optional — JIT-compiles OS-CFAR inner loop for extra speed
+```
+
+Or, from the required + optional packages listed in `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+Python 3.10+ recommended. Tested on macOS.
+
+```bash
+python sonar_station.py
+```
+
+---
+
+## Quick Start
+
+**From a microphone**
+
+1. Launch the app.
+2. Select your input device from the dropdown next to the **MIC** button.
+3. Press **MIC** to start streaming.
+4. The LOFAR waterfall fills with the live spectrum; the DEMON waterfall shows envelope modulation.
+
+**From a WAV file**
+
+1. Press **LOAD WAV** and pick any mono or stereo file.
+2. Press **▶ PLAY**.
+3. The file loops and both waterfalls update in real time. Stereo files are downmixed to mono for analysis — both channels contribute equally.
+
+---
+
+## Use Cases
+
+Point a microphone at the world and get a live map of everything periodic in it. Exact frequencies depend on your machine's speed, blade count, and geometry — the tool shows you the lines; the physics of your specific case tells you what they mean.
+
+- **🚁 Helicopters & ✈️ Aircraft** — separate main rotor from tail rotor, or propeller from turbine, and watch the lines shift as the aircraft changes speed or attitude.
+- **🛸 Drones** — pick out blade-pass tones cleanly even at low signal-to-noise, and tell different makes and models apart by their spectral fingerprint.
+- **🚢 Ships & boats** — the classic naval use case: shaft rate and blade rate from a hydrophone or hull-mounted contact mic, with cavitation showing up as broadband noise.
+- **🏠 Appliances & HVAC** — catch a failing bearing or an imbalanced motor before it fails outright; a healthy motor holds clean, stable lines, a worn one smears them.
+- **🏭 Industrial machinery** — pumps, compressors, gearboxes, conveyors, CNC spindles — anything with a shaft, watched for drift or early fault signs.
+- **🌿 Wildlife** — insect and bird wingbeats, wind-turbine blade rates — all resolved as clean lines instead of a fuzzy hum.
+
+See the [Tips](#tips) section below for concrete settings to start from on a few of these.
+
+---
+
+## Controls
+
+| Action | Effect |
+|---|---|
+| **Scroll wheel on waterfall** | Zoom frequency axis (each panel zooms independently) |
+| **Horizontal scroll on waterfall** | Pan frequency axis |
+| **Double-click waterfall** | Reset zoom to full range |
+| **Drag bandpass reticule edges** | Set analysis/filter band |
+| **Scroll wheel on reticule** | Resize the filter band, anchored on the frequency under the pointer (vertical scroll), or pan it (horizontal scroll) |
+| **History scrollbar** | Scroll back through waterfall history — top of the bar is always live |
+| **NORM dropdown** | Switch normalization algorithm |
+| **ALE checkbox** | Toggle adaptive line enhancer |
+| **AUTO LVL checkbox** | Adaptive display levels (keeps tonals bright without washing out) |
+| **PC1 SUB checkbox** | DEMON-only background-noise suppression via multi-sub-band coherent averaging |
+| **PRESET dropdown** | One-click frequency-scale presets: Drone 0–500 Hz, Drone 0–1 kHz, Ship 0–200 Hz, LOFAR 0–1/2/4/8 kHz, Full (both) |
+| **Color-map dropdown** | Green Phosphor, Night Vision, Amber, Hot, Crimson, Ice, Bone, Copper, Gray, Jet |
+| **📷 SNAP button** | Saves a screenshot (`sonar_station_YYYY-MM-DD_HH-MM-SS.png`) to the current working directory |
+
+Audio output through your speakers plays the bandpass-filtered signal from the reticule band — useful for listening to the frequency slice you're analyzing.
+
+---
+
+## Signal Processing
+
+For anyone who wants to dig into how it actually works — the heavy lifting is done by three algorithms that run in a background thread, leaving the GUI smooth.
+
+**LOFAR — narrowband tonal detection**  
+Each audio chunk is anti-alias-filtered and decimated to 16 kHz, then a 4096-point FFT is computed over a Hanning-windowed ring buffer. The ring buffer approach means the frequency resolution is always `sample_rate / FFT_N ≈ 3.9 Hz/bin` regardless of the chunk size. The spectrum is then normalized by one of four methods before being drawn as a waterfall row.
+
+**DEMON — shaft and blade-rate detection**  
+The audio is bandpass-filtered to the carrier band you set with the reticule, then full-wave-rectified to extract the amplitude envelope. The envelope is low-pass-filtered and decimated to ~2 kHz, giving a Nyquist of 1 kHz — enough to capture blade rates from slow ship screws to fast drone rotors. A 4096-point FFT of the envelope produces the DEMON waterfall. Bin width is ≈ 0.49 Hz (2000 Hz / 4096), so even closely-spaced shaft lines are resolved.
+
+**ALE — Adaptive Line Enhancer**  
+An optional frequency-domain LMS filter (FDAF) that whitens broadband noise and sharpens tonal lines before they reach the FFT. Useful when background noise is high. Toggle with the ALE checkbox.
+
+**Normalization**
+
+| Mode | What it does | Best for |
+|---|---|---|
+| **Off** | Median-subtracted raw dB | Unprocessed reference |
+| **TPSW** | Two-pass split-window (classic sonar) | Moderate tonal density |
+| **Robust** | Percentile-based floor | High tonal density, fast |
+| **OS-CFAR** | Ordered-statistic CFAR with guard cells | Best isolation of strong lines |
+
+---
+
+## Zoom and Resolution
+
+When you scroll to zoom into a narrow frequency range, the app automatically grows the FFT window to maintain true resolution improvement (not just interpolation). At 10× zoom the effective bin width narrows by 10×, resolving lines that would otherwise merge. This uses SciPy's `ZoomFFT` (Chirp Z-transform) over a ring buffer sized to `8 × FFT_N` samples.
+
+---
+
+## Color Maps
+
+| Map | Character |
+|---|---|
+| Green Phosphor | Classic green-screen look |
+| Night Vision | Higher contrast, deeper blacks |
+| Amber | Warm orange — low eye strain |
+| Hot | Black → red → yellow → white |
+| Crimson | High-urgency red |
+| Ice | Deep blue → cyan → white |
+| Bone | Cool blue-grey, subtle |
+| Copper | Black → brown → pale yellow |
+| Gray | Pure grayscale |
+| Jet (analysis) | Rainbow — familiar from MATLAB |
+
+---
+
+## Dependencies
+
+| Package | Role | Required |
+|---|---|---|
+| `PyQt6` | GUI framework | ✅ |
+| `pyqtgraph` | Real-time waterfall rendering | ✅ |
+| `sounddevice` | Mic input and audio output | ✅ |
+| `numpy` | Array math | ✅ |
+| `scipy` | Filters, FFT, ZoomFFT | ✅ |
+| `pyfftw` | FFTW-backed FFT (faster) | optional |
+| `numba` | JIT-compiled OS-CFAR loop | optional |
+
+---
+
+## Tips
+
+- **Drones**: zoom the LOFAR display to 2 000 – 6 000 Hz to isolate the motor harmonic tones. Also set the bandpass reticule (DEMON carrier band) to that same range — DEMON then demodulates the blade-pass frequency from the carrier and shows it as a bright line in the 0 – 500 Hz DEMON panel. Or just use the **Drone 0–500 Hz** preset.
+- **HVAC / appliances**: plug a phone recording in as a WAV. Set NORM to **Robust** to suppress the room noise floor.
+- **Ships / outboards**: use a hydrophone or a contact mic on a hull, feed the signal into your audio interface, and the app works identically.
+- **Aircraft at distance**: a directional mic improves SNR dramatically. Enable ALE to whiten wind noise before the FFT.
+- **Multiple mics**: if you have a matched stereo pair both aimed at the same source, the mono downmix averages two uncorrelated noise floors while the on-axis signal adds coherently — a genuine ~3 dB SNR improvement. A single mic in one channel of a two-channel interface gives you nothing extra; the empty channel contributes only noise to the average.
+- **Factory machinery**: mount an accelerometer with a contact-mic adapter on a bearing housing. The LOFAR waterfall will show the bearing characteristic frequencies as steady horizontal lines; defect sidebands appear symmetrically around the shaft-rate harmonic.
+
+---
+
+## Device Disconnection
+
+If your audio interface is unplugged while streaming, the app stops cleanly and shows a message in the status bar. Restart the application to reconnect — PortAudio on macOS does not reliably recover a lost USB audio session in place.
+
+---
+
+## License
+
+MIT — do whatever you want with it.
