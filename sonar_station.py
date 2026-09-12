@@ -12,6 +12,7 @@
 ║   DEMON  – propeller / drone blade-rate (envelope demodulation)     ║
 ║   ALE    – adaptive line enhancer (optional pre-process)            ║
 ║   NORM   – Off / TPSW / Robust / OS-CFAR (with guard cells)         ║
+║   EIGEN  – cross-frame PCA/SVD subspace denoiser (optional)         ║
 ║                                                                      ║
 ║   CONTROLS:                                                          ║
 ║     Scroll waterfall       – zoom freq axis (each window separate)  ║
@@ -153,6 +154,17 @@ DEMON_DS_SR   = 2000.0         # target envelope rate (Nyquist 1 kHz → support
 # 8  →  1.49 s window @ 44.1 kHz / ds=2  → 0.67 Hz/bin in 0-1 kHz zoom
 # 32 →  5.95 s window @ 44.1 kHz / ds=2  → 0.17 Hz/bin  (ship classification)
 ZOOM_BUF_MULT = 32
+
+# EIGEN — cross-frame PCA/SVD subspace denoiser (LOFAR + DEMON, see
+# _EigenDenoiser below).  HIST = how many past frames form the window the
+# eigen-spectra are estimated from; RANK = how many leading singular
+# vectors are kept per reconstruction; RECALC = re-factor the basis only
+# every N frames (the eigen-spectra of rotating-machinery tonals barely
+# move over a few tens of ms, so this trades imperceptible staleness for
+# an N× cut in SVD calls).
+PCA_HIST   = 24
+PCA_RANK   = 4
+PCA_RECALC = 6
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +487,91 @@ def os_cfar_floor(spectrum: np.ndarray, train: int = 40, guard: int = 3,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  EIGEN — cross-frame PCA/SVD subspace denoiser
+# ═══════════════════════════════════════════════════════════════════════════════
+class _EigenDenoiser:
+    """
+    Rolling low-rank (PCA/SVD) denoiser for a stream of spectra.
+
+    TPSW / Robust / OS-CFAR all estimate a noise floor from a single
+    frame — they only look *across frequency*.  This looks *across time*
+    instead, which is a genuinely different and complementary source of
+    signal: a persistent tonal sits in the same bin frame after frame, so
+    across a short window of history it is almost entirely captured by
+    the first few singular vectors of the frame-by-frame data matrix.
+    Broadband noise that is incoherent from one frame to the next spreads
+    its energy roughly evenly across every singular value. Reconstructing
+    each new frame from only the top `rank` eigen-spectra of that window
+    keeps the persistent structure and drops most of the incoherent tail.
+
+    Expects its input already floor-normalized (TPSW/Robust/OS-CFAR
+    output, signal/floor ratio ~1 at the noise floor) — that puts every
+    bin on a comparable scale so the SVD reflects genuine temporal
+    correlation rather than just which bins happen to carry more raw
+    energy (e.g. low frequencies in a 1/f-ish spectrum).
+
+    Trade-off worth knowing: because rank is fixed and small, a tonal
+    that is weak or only lasts a frame or two may not make the cut and
+    gets smoothed away along with the noise. This sharpens strong,
+    stable lines; it isn't a strict superset of the per-frame floor
+    normalizers and can be turned off if you need every faint transient
+    preserved.
+
+    The basis is refreshed only every `recalc` frames (not every frame)
+    since it barely changes over a few tens of milliseconds — this is
+    the same trade AUTO LVL already makes for its percentile recompute.
+    """
+
+    def __init__(self, n_bins: int, hist: int = PCA_HIST,
+                 rank: int = PCA_RANK, recalc: int = PCA_RECALC) -> None:
+        self.hist   = max(4, int(hist))
+        self.rank   = max(1, int(rank))
+        self.recalc = max(1, int(recalc))
+        self._buf   = np.zeros((self.hist, n_bins), dtype=np.float64)
+        self._n     = 0     # rows filled so far (saturates at hist)
+        self._pos   = 0     # circular write index
+        self._vt    = None  # cached (rank, n_bins) eigen-spectra basis
+        self._age   = 0     # frames since the basis was last refreshed
+
+    def reset(self) -> None:
+        self._buf[:] = 0.0
+        self._n = 0
+        self._pos = 0
+        self._vt = None
+        self._age = 0
+
+    def denoise(self, row: np.ndarray) -> np.ndarray:
+        """Push one new spectrum in, return its low-rank reconstruction."""
+        self._buf[self._pos] = row
+        self._pos = (self._pos + 1) % self.hist
+        self._n = min(self._n + 1, self.hist)
+
+        # Not enough history yet to trust a subspace estimate — pass through.
+        if self._n < max(4, self.rank + 1):
+            return row
+
+        self._age += 1
+        if self._vt is None or self._age >= self.recalc:
+            self._age = 0
+            if self._n < self.hist:
+                mat = self._buf[:self._n]
+            else:
+                # Oldest→newest ordering (doesn't affect SVD, kept for clarity)
+                mat = np.concatenate(
+                    (self._buf[self._pos:], self._buf[:self._pos]), axis=0
+                )
+            try:
+                _, _, vt = np.linalg.svd(mat, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return row
+            r = min(self.rank, vt.shape[0])
+            self._vt = vt[:r]
+
+        coeffs = row @ self._vt.T
+        return coeffs @ self._vt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ALE — Adaptive Line Enhancer (LMS)
 # ═══════════════════════════════════════════════════════════════════════════════
 class AdaptiveLineEnhancer:
@@ -681,6 +778,13 @@ class DSPWorker(QObject):
         self._use_ale = False
         self._ale = AdaptiveLineEnhancer(n_fft=512, mu=0.3, delay=16)
 
+        # Cross-frame PCA/SVD subspace denoiser — applied to the
+        # floor-normalized ratio (TPSW/Robust/OS-CFAR), before dB
+        # conversion. No effect when NORM is Off.
+        self._use_eigen = False
+        self._lofar_eigen = _EigenDenoiser(FFT_N // 2 + 1)
+        self._demon_eigen = _EigenDenoiser(DEMON_FFT_N // 2 + 1)
+
         # DEMON: bandpass → envelope → decimate to fine bin spacing in 0..DEMON_DISP_HI
         self._demon_bp_lo = 800.0
         self._demon_bp_hi = 6000.0
@@ -702,7 +806,7 @@ class DSPWorker(QObject):
         self._demon_hop     = 32   # higher overlap → faster DEMON updates
         self._demon_smooth: np.ndarray | None = None
 
-        # Multi-sub-band DEMON ("PC1 SUB" mode).
+        # Multi-sub-band DEMON ("SUB" mode).
         # The BP region is split into _N_SUB independent sub-bands.  Each
         # sub-band produces its own DEMON power spectrum per hop; averaging N
         # power spectra then taking √ gives √N better amplitude SNR for
@@ -710,7 +814,7 @@ class DSPWorker(QObject):
         # incoherent across bands while the propeller modulation is not.
         # With _N_SUB=8 that is a 2.8× amplitude gain — actually visible.
         _N_SUB = 8
-        self._demon_pc1_enabled: bool = True
+        self._demon_sub_enabled: bool = True
         self._demon_sub_sos:   list = [None] * _N_SUB   # per-band BP SOS
         self._demon_sub_bp_zi: list = [None] * _N_SUB   # per-band BP filter state
         self._demon_sub_lp_zi: list = [None] * _N_SUB   # per-band LP filter state
@@ -765,6 +869,7 @@ class DSPWorker(QObject):
         self._filter_stale  = True
         self._demon_stale   = True
         self._demon_sub_stale = True   # sub-band limits derived from bp_lo/hi
+        self._demon_eigen.reset()      # carrier band moved — history is stale
 
     def set_sr(self, sr: int) -> None:
         self.sr = sr
@@ -778,6 +883,8 @@ class DSPWorker(QObject):
         self._filter_stale = True
         self._demon_stale = True
         self._ale.reset()
+        self._lofar_eigen.reset()
+        self._demon_eigen.reset()
         self._env_buf[:] = 0.0
         self._env_pos = 0
         self._demon_ds_phase = 0
@@ -809,21 +916,32 @@ class DSPWorker(QObject):
         if mode not in ("off", "tpsw", "robust", "oscfar"):
             mode = "robust"
         self._norm_mode = mode
+        # A different normalizer rescales the ratio differently — the eigen
+        # history would otherwise mix incompatible scales.
+        self._lofar_eigen.reset()
+        self._demon_eigen.reset()
 
     def set_ale(self, on: bool) -> None:
         self._use_ale = bool(on)
         if on:
             self._ale.reset()
 
-    def set_demon_pc1(self, on: bool) -> None:
-        """Toggle multi-sub-band DEMON coherent averaging (PC1 SUB button).
+    def set_eigen(self, on: bool) -> None:
+        """Toggle the cross-frame PCA/SVD subspace denoiser (LOFAR + DEMON)."""
+        self._use_eigen = bool(on)
+        if on:
+            self._lofar_eigen.reset()
+            self._demon_eigen.reset()
+
+    def set_demon_sub(self, on: bool) -> None:
+        """Toggle multi-sub-band DEMON coherent averaging (SUB button).
 
         When enabled the broadband DEMON bandpass is split into _N_SUB
         independent sub-bands; their power spectra are averaged per hop and
         √-ed back to magnitude.  Noise is incoherent across bands; propeller
         modulation is coherent → √N SNR gain in amplitude.
         """
-        self._demon_pc1_enabled = bool(on)
+        self._demon_sub_enabled = bool(on)
         if on:
             self._demon_sub_stale = True   # rebuild filters if band changed
 
@@ -875,6 +993,7 @@ class DSPWorker(QObject):
             self._lofar_zoom_hi = float(hi)
         self._lofar_zoom_stale = True
         self._lofar_zoom_obj   = None
+        self._lofar_eigen.reset()   # bin↔frequency mapping just changed
 
     def set_demon_zoom(self, lo: float, hi: float) -> None:
         """Called when the DEMON waterfall zoom changes.  The existing long
@@ -887,6 +1006,7 @@ class DSPWorker(QObject):
             self._demon_zoom_hi = float(hi)
         self._demon_zoom_stale = True
         self._demon_zoom_obj   = None
+        self._demon_eigen.reset()   # bin↔frequency mapping just changed
         # Sub-band buffers are in the audio-frequency domain, not the display
         # frequency axis, so they don't need flushing on zoom changes.
         # But reset LP state so there are no transients after zoom shift.
@@ -1019,6 +1139,8 @@ class DSPWorker(QObject):
             else:
                 norm = None
             if norm is not None:
+                if self._use_eigen:
+                    norm = np.maximum(self._lofar_eigen.denoise(norm), 1e-9)
                 # Reuse norm's fresh buffer: saves 2 temporaries per frame
                 np.log10(norm, out=norm)
                 norm *= 20.0
@@ -1030,13 +1152,13 @@ class DSPWorker(QObject):
 
             # ── DEMON ──────────────────────────────────────────────
             # Classical chain: BP → |·| → LP → decimate → STFT of envelope.
-            # When PC1 SUB is ON the BP region is split into _N_SUB independent
+            # When SUB is ON the BP region is split into _N_SUB independent
             # sub-bands; their power spectra are averaged per hop and √-ed back
             # to magnitude.  Noise is incoherent across bands; propeller
             # modulation is coherent → √N_SUB amplitude SNR gain.
             if self._demon_stale:
                 self._build_demon_filters()
-            if self._demon_pc1_enabled and self._demon_sub_stale:
+            if self._demon_sub_enabled and self._demon_sub_stale:
                 self._build_demon_sub_filters()
 
             if self._demon_sos is not None:
@@ -1080,7 +1202,7 @@ class DSPWorker(QObject):
                 self._demon_hop_acc += n_new
 
                 # ── Sub-band accumulation (parallel with main band) ─────
-                if self._demon_pc1_enabled:
+                if self._demon_sub_enabled:
                     for i, sub_sos in enumerate(self._demon_sub_sos):
                         if sub_sos is None:
                             continue
@@ -1156,12 +1278,12 @@ class DSPWorker(QObject):
                         demon_f_lo = 0.0
                         demon_f_hi = self._demon_ds_sr / 2.0
 
-                    # ── Multi-band coherent averaging (PC1 SUB mode) ────
+                    # ── Multi-band coherent averaging (SUB mode) ────
                     # Average power across all valid sub-bands then √ back
                     # to magnitude.  Zoom is not applied here — the sub-bands
                     # already live in the audio frequency domain and the STFT
                     # frequency axis (0…demon_ds_sr/2) is the same regardless.
-                    if self._demon_pc1_enabled:
+                    if self._demon_sub_enabled:
                         valid = [i for i, s in enumerate(self._demon_sub_sos)
                                  if s is not None]
                         if valid:
@@ -1188,6 +1310,10 @@ class DSPWorker(QObject):
                     else:
                         demon_norm = None
                     if demon_norm is not None:
+                        if self._use_eigen:
+                            demon_norm = np.maximum(
+                                self._demon_eigen.denoise(demon_norm), 1e-9
+                            )
                         np.log10(demon_norm, out=demon_norm)
                         demon_norm *= 20.0
                         demon_db = demon_norm
@@ -1784,7 +1910,8 @@ class SonarStation(QMainWindow):
         self._norm_box.setCurrentIndex(3)
         self._chk_ale.setChecked(True)
         self._chk_auto.setChecked(True)
-        self._chk_pc1.setChecked(True)
+        self._chk_sub.setChecked(True)
+        self._chk_eigen.setChecked(True)
 
     def _make_toolbar(self) -> QWidget:
         bar = QWidget()
@@ -1841,21 +1968,36 @@ class SonarStation(QMainWindow):
             "the display when normalization or ALE is active."
         )
         self._chk_auto.toggled.connect(self._on_auto_levels)
-        self._chk_pc1 = QCheckBox("PC1 SUB")
-        self._chk_pc1.setToolTip(
-            "PC1 background suppression — DEMON display only\n"
-            "Estimates the leading principal component of the last 128\n"
-            "DEMON frames and subtracts its projection from each new row.\n"
-            "Removes correlated broadband noise / gain fluctuations;\n"
-            "sharpens blade-rate and shaft-rate harmonic lines.\n"
-            "Needs ~16 frames of history to arm (~1–2 s)."
+        self._chk_sub = QCheckBox("SUB")
+        self._chk_sub.setToolTip(
+            "SUB — DEMON multi-sub-band coherent averaging\n"
+            "Splits the bandpass (reticule) region into 8 independent\n"
+            "sub-bands, demodulates each one separately, and averages their\n"
+            "power spectra before the DEMON FFT (√ of the mean power).\n"
+            "Propeller / shaft modulation is coherent across sub-bands\n"
+            "while noise is not, giving a √8 ≈ 2.8× amplitude SNR gain."
         )
-        self._chk_pc1.toggled.connect(self._on_demon_pc1)
+        self._chk_sub.toggled.connect(self._on_demon_sub)
+        self._chk_eigen = QCheckBox("EIGEN")
+        self._chk_eigen.setToolTip(
+            "Cross-frame PCA/SVD subspace denoiser (LOFAR + DEMON)\n"
+            "Keeps a short rolling history of floor-normalized spectra and\n"
+            "rebuilds each new one from only its top few eigen-spectra.\n"
+            "A persistent tonal sits in the same bin frame after frame, so\n"
+            "it dominates the leading singular vectors; noise that's\n"
+            "incoherent frame-to-frame is spread across the rest and is\n"
+            "dropped. Sharpens strong, stable lines — a very weak or\n"
+            "short-lived tonal can get smoothed away with the noise, so\n"
+            "toggle off if you need every faint transient preserved.\n"
+            "No effect when NORM is Off."
+        )
+        self._chk_eigen.toggled.connect(self._on_eigen)
 
         g4l.addWidget(self._norm_box)
         g4l.addWidget(self._chk_ale)
         g4l.addWidget(self._chk_auto)
-        g4l.addWidget(self._chk_pc1)
+        g4l.addWidget(self._chk_sub)
+        g4l.addWidget(self._chk_eigen)
         hb.addWidget(g4)
 
         g5 = QGroupBox("AUDIO OUT")
@@ -2035,12 +2177,20 @@ class SonarStation(QMainWindow):
             f"AUTO LVL {'ON — noise-floor relative levels' if on else 'OFF — fixed levels (-10 … 25 dB)'}"
         )
 
-    def _on_demon_pc1(self, on: bool) -> None:
-        self._dsp.set_demon_pc1(on)
+    def _on_demon_sub(self, on: bool) -> None:
+        self._dsp.set_demon_sub(on)
         self._status(
-            "DEMON PC1 SUB  ON — broadband noise suppression active"
+            "DEMON SUB  ON — broadband noise suppression active"
             if on else
-            "DEMON PC1 SUB  OFF"
+            "DEMON SUB  OFF"
+        )
+
+    def _on_eigen(self, on: bool) -> None:
+        self._dsp.set_eigen(on)
+        self._status(
+            "EIGEN  ON — cross-frame PCA/SVD subspace denoising (LOFAR + DEMON)"
+            if on else
+            "EIGEN  OFF"
         )
 
     def _toggle_out(self, on: bool) -> None:

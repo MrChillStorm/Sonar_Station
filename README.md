@@ -90,7 +90,8 @@ See the [Tips](#tips) section below for concrete settings to start from on a few
 | **NORM dropdown** | Switch normalization algorithm |
 | **ALE checkbox** | Toggle adaptive line enhancer |
 | **AUTO LVL checkbox** | Adaptive display levels (keeps tonals bright without washing out) |
-| **PC1 SUB checkbox** | DEMON-only background-noise suppression via multi-sub-band coherent averaging |
+| **SUB checkbox** | DEMON-only background-noise suppression via multi-sub-band coherent averaging |
+| **EIGEN checkbox** | Cross-frame PCA/SVD subspace denoising (LOFAR + DEMON) — sharpens persistent lines, needs NORM on |
 | **PRESET dropdown** | One-click frequency-scale presets: Drone 0–500 Hz, Drone 0–1 kHz, Ship 0–200 Hz, LOFAR 0–1/2/4/8 kHz, Full (both) |
 | **Color-map dropdown** | Green Phosphor, Night Vision, Amber, Hot, Crimson, Ice, Bone, Copper, Gray, Jet |
 | **📷 SNAP button** | Saves a screenshot (`sonar_station_YYYY-MM-DD_HH-MM-SS.png`) to the current working directory |
@@ -101,7 +102,7 @@ Audio output through your speakers plays the bandpass-filtered signal from the r
 
 ## Signal Processing
 
-For anyone who wants to dig into how it actually works — the heavy lifting is done by three algorithms that run in a background thread, leaving the GUI smooth.
+For anyone who wants to dig into how it actually works — the heavy lifting is done by a handful of algorithms that run in a background thread, leaving the GUI smooth.
 
 **LOFAR — narrowband tonal detection**  
 Each audio chunk is anti-alias-filtered and decimated to 16 kHz, then a 4096-point FFT is computed over a Hanning-windowed ring buffer. The ring buffer approach means the frequency resolution is always `sample_rate / FFT_N ≈ 3.9 Hz/bin` regardless of the chunk size. The spectrum is then normalized by one of four methods before being drawn as a waterfall row.
@@ -120,6 +121,9 @@ An optional frequency-domain LMS filter (FDAF) that whitens broadband noise and 
 | **TPSW** | Two-pass split-window (classic sonar) | Moderate tonal density |
 | **Robust** | Percentile-based floor | High tonal density, fast |
 | **OS-CFAR** | Ordered-statistic CFAR with guard cells | Best isolation of strong lines |
+
+**EIGEN — cross-frame PCA/SVD subspace denoiser**  
+Everything above estimates the noise floor from a single frame — it only looks *across frequency*. EIGEN looks *across time* instead: it keeps a rolling window of the last 24 floor-normalized frames (LOFAR and DEMON each have their own), factors that window with an SVD every few frames, and reconstructs each new spectrum from only its top 4 eigen-spectra. A persistent tonal occupies the same bin frame after frame, so it's almost entirely captured by those leading components; noise that's incoherent from one frame to the next is spread across the rest and gets dropped. It's a genuine complement to TPSW/Robust/OS-CFAR rather than a replacement — needs one of those active (no effect on NORM: Off) and trades away very weak or short-lived tonals in exchange for markedly cleaner strong, stable lines. Toggle with the EIGEN checkbox.
 
 ---
 
