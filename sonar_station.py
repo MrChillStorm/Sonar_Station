@@ -63,13 +63,13 @@ _prange = _numba.prange if _NUMBA else range
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QSplitter,
+    QVBoxLayout, QHBoxLayout, QSplitter, QLayout,
     QPushButton, QLabel, QComboBox,
     QGroupBox, QFileDialog, QStatusBar,
     QMenu, QCheckBox, QDoubleSpinBox, QScrollBar,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
-from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QRect, QSize
+from PyQt6.QtGui import QAction, QColor, QFontMetrics, QPainter
 import pyqtgraph as pg
 
 
@@ -2033,6 +2033,17 @@ class Waterfall(pg.PlotWidget):
     def set_cmap(self, cmap: pg.ColorMap) -> None:
         self._img.setColorMap(cmap)
 
+    def set_pixel_smoothing(self, enabled: bool) -> None:
+        """Toggle bilinear interpolation when the waterfall image is
+        scaled up to fill the view. pyqtgraph's ImageItem never requests
+        this hint itself, so it's nearest-neighbor (sharp, blocky) by
+        default — which keeps individual FFT bins/time-rows exact, the
+        more useful reading for tonal lines and transients. Smoothing
+        trades that for a softer look at the cost of blurring adjacent
+        bins together."""
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, enabled)
+        self.viewport().update()
+
     def set_sr(self, sr: int) -> None:
         if sr == self._sr:
             return
@@ -2195,6 +2206,119 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FLOW LAYOUT  —  wraps toolbar groups onto extra rows instead of squeezing
+# ═══════════════════════════════════════════════════════════════════════════════
+class FlowLayout(QLayout):
+    """Left-to-right layout that wraps to a new row when it runs out of
+    horizontal space, instead of shrinking children below their natural
+    (sizeHint) width. Used for the top toolbar so that on a narrow window
+    whole control groups drop to a second/third row rather than every
+    button/combo being compressed until its label is clipped on both
+    sides. Adapted from Qt's standard "Flow Layout" example."""
+
+    def __init__(self, parent=None, margin: int = 0, spacing: int = -1):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items: list = []
+
+    def __del__(self):
+        while self.count():
+            self.takeAt(0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        size += QSize(left + right, top + bottom)
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        spacing = self.spacing()
+
+        # Pass 1 — bucket items into rows. Use sizeHint().expandedTo(minimumSize())
+        # rather than sizeHint() alone: QGroupBox.sizeHint() ignores its own
+        # title text (a long-standing Qt quirk — only minimumSizeHint() accounts
+        # for it), so a box with skinny content but a long title, e.g. "SOURCE
+        # INFO", would otherwise be sized too narrow and its title would clip.
+        rows: list[list[tuple[object, QSize]]] = [[]]
+        x = effective.x()
+        for item in self._items:
+            size = item.sizeHint().expandedTo(item.minimumSize())
+            next_x = x + size.width() + spacing
+            if next_x - spacing > effective.right() and rows[-1]:
+                rows.append([])
+                x = effective.x()
+                next_x = x + size.width() + spacing
+            rows[-1].append((item, size))
+            x = next_x
+
+        # Pass 2 — place each row, stretching every item to that row's
+        # tallest height so group-box bottoms line up instead of ragged
+        # top-alignment (matches QHBoxLayout's default cross-axis stretch).
+        y = effective.y()
+        for row in rows:
+            if not row:
+                continue
+            row_height = max(size.height() for _, size in row)
+            x = effective.x()
+            for item, size in row:
+                if not test_only:
+                    item.setGeometry(QRect(x, y, size.width(), row_height))
+                x += size.width() + spacing
+            y += row_height + spacing
+
+        total_height = y - spacing - effective.y() if rows[0] else 0
+        return top + total_height + bottom
+
+
+def _fit_groupbox_title(box: QGroupBox) -> None:
+    """QGroupBox.minimumSizeHint() reserves exactly title-width + the QSS
+    left inset (8px) for the title bar — zero right-side clearance — so a
+    bold, letter-spaced title (e.g. "SOURCE INFO") over skinny content
+    sits flush against the box's own border and its last glyph visibly
+    clips at the rounded corner. Force real breathing room from the
+    title's own font metrics rather than trusting that hint."""
+    box.ensurePolished()
+    fm = QFontMetrics(box.font())
+    needed = fm.horizontalAdvance(box.title()) + 8 + 20   # left inset + right buffer
+    if box.minimumWidth() < needed:
+        box.setMinimumWidth(needed)
+
+
 def _fmt_khz(hz: float) -> str:
     """Compact sample-rate label for the SOURCE INFO strip — 48000 → "48kHz",
     44100 → "44.1kHz" — instead of the wider "48,000 Hz" form."""
@@ -2247,7 +2371,10 @@ class SonarStation(QMainWindow):
         vb = QVBoxLayout(root)
         vb.setContentsMargins(8, 6, 8, 4)
         vb.setSpacing(2)
-        vb.addWidget(self._make_toolbar())
+        toolbar = self._make_toolbar()
+        vb.addWidget(toolbar)
+        for box in toolbar.findChildren(QGroupBox):
+            _fit_groupbox_title(box)
 
         self._split = QSplitter(Qt.Orientation.Vertical)
         self._split.setChildrenCollapsible(False)
@@ -2315,7 +2442,7 @@ class SonarStation(QMainWindow):
 
     def _make_toolbar(self) -> QWidget:
         bar = QWidget()
-        hb = QHBoxLayout(bar)
+        hb = FlowLayout(bar)
         hb.setContentsMargins(0, 0, 0, 0)
         hb.setSpacing(8)
 
@@ -2453,6 +2580,17 @@ class SonarStation(QMainWindow):
         )
         self._cmap_box.currentTextChanged.connect(self._on_cmap)
         g6l.addWidget(self._cmap_box)
+
+        self._chk_smooth = QCheckBox("SMOOTH")
+        self._chk_smooth.setToolTip(
+            "Pixel smoothing for the LOFAR/DEMON waterfall image\n"
+            "Off (default) — sharp, exact per-bin/per-row pixels;\n"
+            "best for reading tonal lines and transients precisely.\n"
+            "On — bilinear-interpolated, softer look; can blur\n"
+            "adjacent bins together."
+        )
+        self._chk_smooth.toggled.connect(self._on_smooth)
+        g6l.addWidget(self._chk_smooth)
         hb.addWidget(g6)
 
         g7 = QGroupBox("PRESET")
@@ -2478,12 +2616,13 @@ class SonarStation(QMainWindow):
         g7l.addWidget(self._preset_box)
         hb.addWidget(g7)
 
-        hb.addStretch()
-
+        g8 = QGroupBox("CAPTURE")
+        g8l = QHBoxLayout(g8)
         btn_snap = QPushButton("📷 SNAP")
         btn_snap.setToolTip("Save screenshot to current directory")
         btn_snap.clicked.connect(self._screenshot)
-        hb.addWidget(btn_snap)
+        g8l.addWidget(btn_snap)
+        hb.addWidget(g8)
 
         return bar
 
@@ -2598,6 +2737,11 @@ class SonarStation(QMainWindow):
         self._wf_lofar.set_cmap(cmap)
         self._wf_demon.set_cmap(cmap)
         self._status(f"DISPLAY  {name}")
+
+    def _on_smooth(self, enabled: bool) -> None:
+        self._wf_lofar.set_pixel_smoothing(enabled)
+        self._wf_demon.set_pixel_smoothing(enabled)
+        self._status(f"DISPLAY  pixel smoothing {'ON' if enabled else 'OFF'}")
 
     def _on_preset(self, _idx: int = 0) -> None:
         key = self._preset_box.currentData()
@@ -2916,9 +3060,9 @@ class SonarStation(QMainWindow):
 
 def main() -> None:
     try:
-        pg.setConfigOptions(antialias=False, useOpenGL=True)
+        pg.setConfigOptions(antialias=True, useOpenGL=True)
     except Exception:
-        pg.setConfigOptions(antialias=True)
+        pg.setConfigOptions(antialias=False)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = SonarStation()

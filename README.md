@@ -96,6 +96,7 @@ See the [Tips](#tips) section below for concrete settings to start from on a few
 | **CAL checkbox** | Apply the captured calibration — removes stable interference (hum, self-noise) the other stages can't touch |
 | **PRESET dropdown** | One-click frequency-scale presets: Drone 0–500 Hz, Drone 0–1 kHz, Ship 0–200 Hz, LOFAR 0–1/2/4/8 kHz, Full (both) |
 | **Color-map dropdown** | Green Phosphor, Night Vision, Amber, Hot, Crimson, Ice, Bone, Copper, Gray, Jet |
+| **SMOOTH checkbox** | Bilinear-smooths the waterfall pixels instead of the default sharp/blocky per-bin rendering. Off by default — smoothing blurs adjacent bins together, so the sharp version reads narrowband tonals more precisely. Effect is subtle at full zoom-out (bin count roughly matches screen pixels) and becomes clearly visible once you zoom into a narrower band |
 | **📷 SNAP button** | Saves a screenshot (`sonar_station_YYYY-MM-DD_HH-MM-SS.png`) to the current working directory |
 
 Audio output through your speakers plays the bandpass-filtered signal from the reticule band — useful for listening to the frequency slice you're analyzing.
