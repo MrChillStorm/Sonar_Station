@@ -13,6 +13,7 @@
 ║   ALE    – adaptive line enhancer (optional pre-process)            ║
 ║   NORM   – Off / TPSW / Robust / OS-CFAR (with guard cells)         ║
 ║   EIGEN  – cross-frame PCA/SVD subspace denoiser (optional)         ║
+║   CAL    – dark-frame-style noise calibration (optional)            ║
 ║                                                                      ║
 ║   CONTROLS:                                                          ║
 ║     Scroll waterfall       – zoom freq axis (each window separate)  ║
@@ -165,6 +166,12 @@ ZOOM_BUF_MULT = 32
 PCA_HIST   = 24
 PCA_RANK   = 4
 PCA_RECALC = 6
+
+# CAL — dark-frame-style noise calibration (see _DarkCalibrator below).
+# Default capture length for a CAL CAPTURE — long enough to average down
+# random noise in the master spectrum without asking for an unreasonably
+# long "hold still, target absent" period.
+CAL_DURATION_S = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -572,6 +579,206 @@ class _EigenDenoiser:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  CAL — dark-frame-style noise calibration
+# ═══════════════════════════════════════════════════════════════════════════════
+def _sigma_clipped_mean(frames: np.ndarray, sigma: float = 3.0,
+                         iters: int = 2) -> np.ndarray:
+    """
+    Per-bin sigma-clipped mean across frames (axis 0) — the same combine
+    method used for astronomical master darks: keeps more of the data than
+    a plain median (so the result is quieter) while still rejecting
+    one-off outlier frames — a transient noise burst during calibration —
+    that a plain mean would otherwise bake into the result permanently.
+    """
+    data = frames.astype(np.float64)
+    mask = np.ones(data.shape, dtype=bool)
+    for _ in range(max(1, iters)):
+        n    = np.maximum(mask.sum(axis=0), 1)
+        mean = (data * mask).sum(axis=0) / n
+        var  = ((data - mean) ** 2 * mask).sum(axis=0) / n
+        std  = np.sqrt(var)
+        new_mask = np.abs(data - mean) <= (sigma * std + 1e-12)
+        keep = new_mask.sum(axis=0) > 0    # never clip an entire column empty
+        mask = np.where(keep, new_mask, mask)
+    n = np.maximum(mask.sum(axis=0), 1)
+    return (data * mask).sum(axis=0) / n
+
+
+class _DarkCalibrator:
+    """
+    Dark-frame-style noise calibration for one spectrum stream (LOFAR or
+    DEMON) — operates on the NORMALIZED ratio (TPSW/Robust/OS-CFAR output,
+    ~1.0 at the noise floor), *not* the raw pre-normalization magnitude.
+
+    TPSW / Robust / OS-CFAR / EIGEN all estimate the noise floor from the
+    live signal itself, which is exactly why they preserve narrowband
+    tonals — a real target line and a "floor outlier" look the same to a
+    self-referential estimator. This instead uses a separately measured
+    reference, the audio equivalent of matching exposure and sensor
+    temperature for an astronomical dark frame: capture a few seconds of
+    the normalized spectrum with the target absent but everything else
+    identical (same gain, same mic, same environment, same NORM mode),
+    and build a master excess-ratio profile from those frames. Dividing
+    that master out of every future frame can then remove stable
+    narrowband interference that's otherwise invisible to the other
+    stages: mains hum and its harmonics, ground-loop buzz, a fixed
+    self-noise spur in the audio interface.
+
+    Why this has to run *after* normalization rather than on the raw
+    spectrum like a real sensor's raw counts: a floor normalizer's output
+    is already a ratio to its own freshly-recomputed local floor, so
+    subtracting anything from the raw magnitude before it runs gets
+    largely undone — shrink the broadband floor pre-normalization and the
+    normalizer's local-floor estimate shrinks by roughly the same amount,
+    leaving its output ratio for ordinary bins almost unchanged while
+    *inflating* the ratio of anything that wasn't part of the calibration
+    (a new target), because the local floor computed around it just got
+    smaller too. Working on the ratio instead avoids that.
+
+    That alone isn't sufficient, though: the master also gets re-centered
+    (see _finish) so an *ordinary* bin's value is ~1.0, because a
+    normalizer's own typical output isn't necessarily 1.0 — OS-CFAR at
+    rank=0.72, for instance, puts most ordinary bins measurably *below*
+    1.0 by construction. Skip that re-centering and dividing by the raw
+    master rescales every bin uniformly, background included, instead of
+    leaving ordinary bins alone and pulling down only the bin that was
+    itself elevated during calibration — a stable, tonal-looking
+    interferer the normalizer treats as signal and therefore never
+    touches on its own.
+
+    The calibration frames are combined with a sigma-clipped mean, not a
+    plain average — see _sigma_clipped_mean.
+
+    Caveat inherited directly from real dark-frame calibration: this only
+    helps for interference that's present independent of the target.
+    Calibrate with the wrong reference (e.g. the interference only shows
+    up when the target is also present) and it divides out your signal,
+    not just the noise.
+    """
+
+    def __init__(self, n_bins: int, sigma: float = 3.0) -> None:
+        self.n_bins  = int(n_bins)
+        self.sigma   = float(sigma)
+        self._capturing = False
+        self._frames: list = []
+        self._t_start = 0.0
+        self._duration = CAL_DURATION_S
+        self._master: np.ndarray | None = None   # (n_bins,) linear ratio
+
+    def start(self, duration: float = CAL_DURATION_S) -> None:
+        self._capturing = True
+        self._frames = []
+        self._t_start = time.monotonic()
+        self._duration = float(duration)
+
+    @property
+    def capturing(self) -> bool:
+        return self._capturing
+
+    @property
+    def armed(self) -> bool:
+        return self._master is not None
+
+    def remaining(self) -> float:
+        if not self._capturing:
+            return 0.0
+        return max(0.0, self._duration - (time.monotonic() - self._t_start))
+
+    def feed(self, ratio: np.ndarray) -> None:
+        """Call once per frame with the post-NORM linear ratio (cheap
+        no-op unless a capture is running)."""
+        if not self._capturing:
+            return
+        self._frames.append(np.asarray(ratio, dtype=np.float64).copy())
+        if time.monotonic() - self._t_start >= self._duration:
+            self._finish()
+
+    def _finish(self) -> None:
+        self._capturing = False
+        frames, self._frames = self._frames, []
+        if len(frames) < 4:
+            self._master = None
+            return
+        mat = np.stack(frames, axis=0)
+        master = _sigma_clipped_mean(mat, sigma=self.sigma)
+        # Re-center so an ORDINARY bin's master value is ~1.0 — dividing by
+        # it is then a no-op there, and only a bin that was itself elevated
+        # relative to the rest of the calibration spectrum gets suppressed.
+        # This matters because a normalizer's own "typical" output isn't
+        # necessarily 1.0: OS-CFAR at rank=0.72, for instance, puts most
+        # ordinary bins measurably *below* 1.0 by construction (that's what
+        # makes it a rank detector). Skip this and dividing by the raw,
+        # un-recentered master — whatever its natural bias happens to be —
+        # rescales every bin uniformly, background included: exactly the
+        # "noise got brighter" failure this recentering exists to prevent.
+        baseline = float(np.median(master))
+        if baseline > 1e-9:
+            master = master / baseline
+        self._master = np.maximum(master, 0.3)   # keep well clear of 0
+
+    def clear(self) -> None:
+        self._capturing = False
+        self._frames = []
+        self._master = None
+
+    def peak_excess_db(self) -> float:
+        """How much the strongest bin in the master profile sits above the
+        re-centered baseline (~1.0) — i.e. the biggest correction CAL will
+        actually make. An objective sanity check independent of how it
+        looks on a color-mapped, AUTO-LVL-adjusted waterfall: near 0 dB
+        means the capture didn't find any bin standing out from the rest
+        of the calibration spectrum, so there's nothing for CAL to remove."""
+        if self._master is None:
+            return 0.0
+        return float(20.0 * np.log10(np.max(self._master)))
+
+    def peak_bin_index(self) -> int:
+        """Bin index of the strongest correction, or -1 if not armed."""
+        if self._master is None:
+            return -1
+        return int(np.argmax(self._master))
+
+    def db_at(self, bin_idx: int) -> float:
+        """Excess in dB the master profile carries at one bin."""
+        if self._master is None or bin_idx < 0:
+            return 0.0
+        return float(20.0 * np.log10(self._master[bin_idx]))
+
+    def excess_peaks(self, threshold_db: float = 3.0,
+                      min_separation_bins: int = 5,
+                      max_peaks: int = 8) -> list:
+        """Bin indices of distinct excess peaks in the master profile,
+        strongest first — every simultaneous interferer CAL actually
+        corrects, not just the single loudest one. Greedy: picks the
+        tallest remaining candidate bin, then excludes everything within
+        min_separation_bins of it before picking the next, so one wide
+        interferer's shoulder bins don't get reported as several."""
+        if self._master is None:
+            return []
+        db = 20.0 * np.log10(self._master)
+        candidates = sorted(
+            (i for i in range(len(db)) if db[i] >= threshold_db),
+            key=lambda i: db[i], reverse=True,
+        )
+        picked: list = []
+        for i in candidates:
+            if all(abs(i - p) > min_separation_bins for p in picked):
+                picked.append(i)
+                if len(picked) >= max_peaks:
+                    break
+        return picked
+
+    def apply(self, ratio: np.ndarray) -> np.ndarray:
+        """Divide out the master excess-ratio profile: a no-op (~÷1.0) at
+        every bin that sat at the floor during calibration, and real
+        suppression only where the master itself was elevated — a stable
+        interferer the normalizer would otherwise treat as a tonal."""
+        if self._master is None or len(self._master) != len(ratio):
+            return ratio
+        return ratio / self._master
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ALE — Adaptive Line Enhancer (LMS)
 # ═══════════════════════════════════════════════════════════════════════════════
 class AdaptiveLineEnhancer:
@@ -785,6 +992,13 @@ class DSPWorker(QObject):
         self._lofar_eigen = _EigenDenoiser(FFT_N // 2 + 1)
         self._demon_eigen = _EigenDenoiser(DEMON_FFT_N // 2 + 1)
 
+        # Dark-frame-style noise calibration — runs on raw mag, before any
+        # NORM mode, so it's independent of (and composes with) NORM/EIGEN.
+        self._use_cal = False
+        self._cal_pending_enable = False
+        self._cal_lofar = _DarkCalibrator(FFT_N // 2 + 1)
+        self._cal_demon = _DarkCalibrator(DEMON_FFT_N // 2 + 1)
+
         # DEMON: bandpass → envelope → decimate to fine bin spacing in 0..DEMON_DISP_HI
         self._demon_bp_lo = 800.0
         self._demon_bp_hi = 6000.0
@@ -870,6 +1084,7 @@ class DSPWorker(QObject):
         self._demon_stale   = True
         self._demon_sub_stale = True   # sub-band limits derived from bp_lo/hi
         self._demon_eigen.reset()      # carrier band moved — history is stale
+        self._cal_demon.clear()        # carrier band moved — old dark no longer matches
 
     def set_sr(self, sr: int) -> None:
         self.sr = sr
@@ -885,6 +1100,8 @@ class DSPWorker(QObject):
         self._ale.reset()
         self._lofar_eigen.reset()
         self._demon_eigen.reset()
+        self._cal_lofar.clear()
+        self._cal_demon.clear()
         self._env_buf[:] = 0.0
         self._env_pos = 0
         self._demon_ds_phase = 0
@@ -917,9 +1134,12 @@ class DSPWorker(QObject):
             mode = "robust"
         self._norm_mode = mode
         # A different normalizer rescales the ratio differently — the eigen
-        # history would otherwise mix incompatible scales.
+        # history and any dark-frame calibration would otherwise be
+        # applied against a scale they weren't measured on.
         self._lofar_eigen.reset()
         self._demon_eigen.reset()
+        self._cal_lofar.clear()
+        self._cal_demon.clear()
 
     def set_ale(self, on: bool) -> None:
         self._use_ale = bool(on)
@@ -932,6 +1152,76 @@ class DSPWorker(QObject):
         if on:
             self._lofar_eigen.reset()
             self._demon_eigen.reset()
+
+    def start_cal_capture(self, duration: float = CAL_DURATION_S) -> None:
+        """Begin a dark-frame-style noise calibration capture (LOFAR and
+        DEMON together). Any previously-applied calibration is suspended
+        for the duration of the capture so it can't contaminate the new
+        one; CAL is re-enabled automatically once capture finishes."""
+        self._use_cal = False
+        self._lofar_eigen.reset()   # about to change scale under EIGEN's feet
+        self._demon_eigen.reset()
+        self._cal_lofar.start(duration)
+        self._cal_demon.start(duration)
+        self._cal_pending_enable = True
+
+    def cal_capturing(self) -> bool:
+        return self._cal_lofar.capturing or self._cal_demon.capturing
+
+    def cal_remaining(self) -> float:
+        return max(self._cal_lofar.remaining(), self._cal_demon.remaining())
+
+    def cal_armed(self) -> bool:
+        return self._cal_lofar.armed or self._cal_demon.armed
+
+    def _lofar_bin_hz(self, bin_idx: int) -> float:
+        """Map a LOFAR bin index to Hz under whatever frequency range is
+        currently in effect (full range or the active ZoomFFT span — valid
+        because a zoom change clears any calibration, so an armed
+        calibration was necessarily captured under the range still active
+        now)."""
+        if bin_idx < 0:
+            return 0.0
+        n_bins = FFT_N // 2 + 1
+        if self._lofar_zoom_lo is not None:
+            lo, hi = self._lofar_zoom_lo, self._lofar_zoom_hi
+        else:
+            lo, hi = 0.0, self.lofar_sr / 2.0
+        return lo + (hi - lo) * bin_idx / max(1, n_bins - 1)
+
+    def _demon_bin_hz(self, bin_idx: int) -> float:
+        """DEMON equivalent of _lofar_bin_hz."""
+        if bin_idx < 0:
+            return 0.0
+        n_bins = DEMON_FFT_N // 2 + 1
+        if self._demon_zoom_lo is not None:
+            lo, hi = self._demon_zoom_lo, self._demon_zoom_hi
+        else:
+            lo, hi = 0.0, self._demon_ds_sr / 2.0
+        return lo + (hi - lo) * bin_idx / max(1, n_bins - 1)
+
+    def cal_peaks_info(self, threshold_db: float = 3.0,
+                        max_peaks: int = 6) -> list:
+        """Every distinct interferer the last capture actually found and
+        will suppress (LOFAR + DEMON together), strongest first — not just
+        the single loudest one. Each entry is (stream, hz, db)."""
+        out = []
+        for stream, cal, to_hz in (
+            ("LOFAR", self._cal_lofar, self._lofar_bin_hz),
+            ("DEMON", self._cal_demon, self._demon_bin_hz),
+        ):
+            for b in cal.excess_peaks(threshold_db=threshold_db, max_peaks=max_peaks):
+                out.append((stream, to_hz(b), cal.db_at(b)))
+        out.sort(key=lambda t: t[2], reverse=True)
+        return out[:max_peaks]
+
+    def set_cal(self, on: bool) -> None:
+        """Toggle applying the captured dark-frame calibration."""
+        self._use_cal = bool(on)
+        # Either direction is a scale change for whatever EIGEN sees —
+        # don't let its rolling window straddle the transition.
+        self._lofar_eigen.reset()
+        self._demon_eigen.reset()
 
     def set_demon_sub(self, on: bool) -> None:
         """Toggle multi-sub-band DEMON coherent averaging (SUB button).
@@ -994,6 +1284,7 @@ class DSPWorker(QObject):
         self._lofar_zoom_stale = True
         self._lofar_zoom_obj   = None
         self._lofar_eigen.reset()   # bin↔frequency mapping just changed
+        self._cal_lofar.clear()     # bin↔frequency mapping just changed
 
     def set_demon_zoom(self, lo: float, hi: float) -> None:
         """Called when the DEMON waterfall zoom changes.  The existing long
@@ -1007,6 +1298,7 @@ class DSPWorker(QObject):
         self._demon_zoom_stale = True
         self._demon_zoom_obj   = None
         self._demon_eigen.reset()   # bin↔frequency mapping just changed
+        self._cal_demon.clear()     # bin↔frequency mapping just changed
         # Sub-band buffers are in the audio-frequency domain, not the display
         # frequency axis, so they don't need flushing on zoom changes.
         # But reset LP state so there are no transients after zoom shift.
@@ -1139,6 +1431,14 @@ class DSPWorker(QObject):
             else:
                 norm = None
             if norm is not None:
+                # Dark-frame-style calibration — divide out a measured,
+                # stable interference profile (mains hum, self-noise
+                # spurs) before EIGEN sees it.  Runs on the normalized
+                # ratio, not raw mag — see _DarkCalibrator's docstring for
+                # why it has to be post-NORM to actually do anything.
+                self._cal_lofar.feed(norm)
+                if self._use_cal:
+                    norm = self._cal_lofar.apply(norm)
                 if self._use_eigen:
                     norm = np.maximum(self._lofar_eigen.denoise(norm), 1e-9)
                 # Reuse norm's fresh buffer: saves 2 temporaries per frame
@@ -1310,6 +1610,12 @@ class DSPWorker(QObject):
                     else:
                         demon_norm = None
                     if demon_norm is not None:
+                        # Dark-frame-style calibration — see the LOFAR
+                        # comment above; same reasoning, applied to the
+                        # DEMON envelope's own normalized ratio.
+                        self._cal_demon.feed(demon_norm)
+                        if self._use_cal:
+                            demon_norm = self._cal_demon.apply(demon_norm)
                         if self._use_eigen:
                             demon_norm = np.maximum(
                                 self._demon_eigen.denoise(demon_norm), 1e-9
@@ -1331,6 +1637,14 @@ class DSPWorker(QObject):
                         self._demon_smooth *= 0.45
                         self._demon_smooth += demon_db
                     demon_pkg = (self._demon_smooth, demon_f_lo, demon_f_hi)
+
+            # A CAL CAPTURE just finished on both streams — start applying
+            # whatever master(s) came out of it.
+            if self._cal_pending_enable and not self.cal_capturing():
+                self._cal_pending_enable = False
+                self._use_cal = self.cal_armed()
+                self._lofar_eigen.reset()
+                self._demon_eigen.reset()
 
             # Emit tuples (spec, f_lo, f_hi) so the Waterfall can set its
             # image rect correctly for both full-range and zoomed spectra.
@@ -1833,6 +2147,7 @@ class SonarStation(QMainWindow):
 
         self._pending_lofar: np.ndarray | None = None
         self._pending_demon: np.ndarray | None = None
+        self._cal_was_capturing = False
 
         self._build_ui()
 
@@ -1992,12 +2307,42 @@ class SonarStation(QMainWindow):
             "No effect when NORM is Off."
         )
         self._chk_eigen.toggled.connect(self._on_eigen)
+        self._btn_cal = QPushButton("CAL CAPTURE")
+        self._btn_cal.setToolTip(
+            "Capture a dark-frame-style noise calibration (LOFAR + DEMON)\n"
+            f"Hold the mic on target-absent, otherwise-identical conditions\n"
+            f"(same gain, same environment, same NORM mode) for\n"
+            f"{CAL_DURATION_S:g} s — the button counts down. Builds a master\n"
+            "excess-ratio profile from the NORMALIZED spectrum (sigma-clipped\n"
+            "across frames, same combine method as an astronomical master\n"
+            "dark) and switches CAL on automatically once it's done.\n"
+            "Needs a NORM mode other than Off."
+        )
+        self._btn_cal.clicked.connect(self._on_cal_capture)
+        self._chk_cal = QCheckBox("CAL")
+        self._chk_cal.setToolTip(
+            "Apply the captured dark-frame noise calibration (LOFAR + DEMON)\n"
+            "Divides the CAL CAPTURE master ratio out of every future\n"
+            "normalized frame, right after NORM runs. Unlike TPSW/Robust/\n"
+            "OS-CFAR/EIGEN — which estimate the floor from the live signal\n"
+            "and so can't touch anything that looks like a genuine tonal —\n"
+            "this removes specific, stable interference (mains hum,\n"
+            "self-noise, a fixed fan/HVAC tone) actually measured with the\n"
+            "target absent. A bin that sat at the floor during calibration\n"
+            "is untouched; only a bin that was itself elevated then gets\n"
+            "pulled back down. Needs a CAL CAPTURE first, and switching\n"
+            "NORM mode clears it (it's calibrated to that mode's scale).\n"
+            "Only helps for interference present independent of your target."
+        )
+        self._chk_cal.toggled.connect(self._on_cal)
 
         g4l.addWidget(self._norm_box)
         g4l.addWidget(self._chk_ale)
         g4l.addWidget(self._chk_auto)
         g4l.addWidget(self._chk_sub)
         g4l.addWidget(self._chk_eigen)
+        g4l.addWidget(self._btn_cal)
+        g4l.addWidget(self._chk_cal)
         hb.addWidget(g4)
 
         g5 = QGroupBox("AUDIO OUT")
@@ -2084,6 +2429,42 @@ class SonarStation(QMainWindow):
             arr, f_lo, f_hi = self._pending_demon
             self._wf_demon.push(arr, f_lo, f_hi)
             self._pending_demon = None
+
+        # CAL CAPTURE countdown / completion — polled rather than
+        # signaled, same convention as the input-stream liveness check
+        # above.
+        if self._dsp.cal_capturing():
+            self._cal_was_capturing = True
+            self._btn_cal.setText(f"CAL {self._dsp.cal_remaining():0.1f}s")
+        elif self._cal_was_capturing:
+            self._cal_was_capturing = False
+            self._btn_cal.setEnabled(True)
+            self._btn_cal.setText("CAL CAPTURE")
+            armed = self._dsp.cal_armed()
+            self._chk_cal.blockSignals(True)
+            self._chk_cal.setChecked(armed)
+            self._chk_cal.blockSignals(False)
+            if armed:
+                peaks = self._dsp.cal_peaks_info(threshold_db=3.0, max_peaks=6)
+                if peaks:
+                    n = len(peaks)
+                    parts = ", ".join(
+                        f"{hz:,.0f} Hz {db:+.1f}dB ({stream})"
+                        for stream, hz, db in peaks
+                    )
+                    self._status(
+                        f"CAL CAPTURE done — CAL ON  ·  {n} interferer"
+                        f"{'s' if n != 1 else ''} found: {parts}"
+                    )
+                else:
+                    self._status(
+                        "CAL CAPTURE done — CAL ON, but nothing stood out "
+                        "above the noise (no interference found to remove)"
+                    )
+            else:
+                self._status(
+                    "CAL CAPTURE failed — not enough frames captured, CAL still OFF"
+                )
 
     def _screenshot(self) -> None:
         path = time.strftime("sonar_station_%Y-%m-%d_%H-%M-%S.png")
@@ -2191,6 +2572,31 @@ class SonarStation(QMainWindow):
             "EIGEN  ON — cross-frame PCA/SVD subspace denoising (LOFAR + DEMON)"
             if on else
             "EIGEN  OFF"
+        )
+
+    def _on_cal_capture(self) -> None:
+        if self._norm_box.currentData() == "off":
+            self._status(
+                "CAL needs a NORM mode — it calibrates the normalized "
+                "ratio, not the raw spectrum. Pick TPSW/Robust/OS-CFAR first."
+            )
+            return
+        self._dsp.start_cal_capture(CAL_DURATION_S)
+        self._chk_cal.blockSignals(True)
+        self._chk_cal.setChecked(False)
+        self._chk_cal.blockSignals(False)
+        self._btn_cal.setEnabled(False)
+        self._status(
+            f"CAL CAPTURE  —  hold target-absent, otherwise-identical "
+            f"conditions for {CAL_DURATION_S:g} s…"
+        )
+
+    def _on_cal(self, on: bool) -> None:
+        self._dsp.set_cal(on)
+        self._status(
+            "CAL  ON — dark-frame noise subtraction active"
+            if on else
+            "CAL  OFF"
         )
 
     def _toggle_out(self, on: bool) -> None:
