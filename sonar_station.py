@@ -420,33 +420,65 @@ def _os_cfar_kernel_vec(x: np.ndarray, train: int, guard: int,
     """
     Fully-vectorised OS-CFAR kernel — no Python-level loops.
 
-    Builds all training windows at once with sliding_window_view, strips
-    the guard zone via a boolean mask, then finds the k-th order statistic
-    across all bins in a single np.partition call (C-level, O(n * 2*train)).
+    Matches _os_cfar_kernel_py's edge handling exactly: near the array
+    boundaries a bin's training window has fewer than 2*train real
+    samples available, and the order statistic is taken over however many
+    real samples actually exist — never padded with duplicates of the
+    edge value. (An earlier version padded with the edge value, which is
+    simpler to vectorize but silently gave a numba-dependent answer within
+    train+guard bins of DC and Nyquist — exactly the range that matters
+    most for LOFAR, since that's where shaft-rate/hum content lives.)
 
-    ~10-30× faster than the Python loop version when Numba is unavailable.
+    Achieves this by padding with +inf sentinels (never real data) so
+    they always sort to the tail of each row, then reading off the k-th
+    *real* order statistic, where k is computed per bin from that bin's
+    actual real-sample count — the same arithmetic _os_cfar_kernel_py
+    uses. A per-row-varying k rules out np.partition (its kth applies to
+    every row alike), so this sorts each row fully instead; still a
+    single vectorized call, just O(n·log(2·train)) instead of O(n).
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
-    n     = len(x)
-    w     = train + guard          # one-sided half-window
-    pad   = np.pad(x, w, mode='edge')
+    n   = len(x)
+    w   = train + guard          # one-sided half-window
+    pad = np.pad(x, w, mode='constant', constant_values=np.inf)
     # views: (n, 2*w+1) — every bin's symmetric window including guard zone
     views = sliding_window_view(pad, 2 * w + 1)
 
     # Build a mask that removes the central 2*guard+1 guard cells, keeping
-    # exactly 2*train training cells per row.
+    # 2*train training slots per row (some may be +inf sentinels near an edge).
     mask = np.ones(2 * w + 1, dtype=bool)
     mask[w - guard: w + guard + 1] = False   # zero out guard zone
     training = np.ascontiguousarray(views[:, mask])  # (n, 2*train)
 
-    # k-th order statistic across training cells — single C call
-    n_train = training.shape[1]
-    k = int(round(rank * (n_train - 1)))
-    k = max(0, min(k, n_train - 1))
-    np.partition(training, k, axis=1, out=training)
-    floor = training[:, k].astype(np.float64)
-    return floor
+    # Per-row count of REAL (non-sentinel) training cells — identical
+    # ls/le/rs/re bookkeeping to _os_cfar_kernel_py, vectorized over i.
+    i = np.arange(n)
+    left_end   = i - guard
+    left_start = left_end - train
+    ls         = np.maximum(0, left_start)
+    left_count = np.maximum(0, left_end - ls)
+
+    right_start = i + guard + 1
+    right_end   = right_start + train
+    re          = np.minimum(n, right_end)
+    right_count = np.maximum(0, re - right_start)
+
+    count = left_count + right_count   # (n,) real training cells per bin
+
+    # k-th order statistic among each row's real cells only. +inf
+    # sentinels always sort to the tail, so sorting the full padded row
+    # and indexing by a per-row k (bounded by that row's real count)
+    # never touches a sentinel.
+    span = np.maximum(count - 1, 0)
+    k = np.clip(np.round(rank * span).astype(np.int64), 0, span)
+    training_sorted = np.sort(training, axis=1)
+    floor = np.take_along_axis(training_sorted, k[:, None], axis=1)[:, 0]
+
+    # Degenerate case (no real training cells at all) — pass the bin
+    # itself through unchanged, matching _os_cfar_kernel_py.
+    floor = np.where(count > 0, floor, x)
+    return floor.astype(np.float64)
 
 
 if _NUMBA:
@@ -582,13 +614,18 @@ class _EigenDenoiser:
 #  CAL — dark-frame-style noise calibration
 # ═══════════════════════════════════════════════════════════════════════════════
 def _sigma_clipped_mean(frames: np.ndarray, sigma: float = 3.0,
-                         iters: int = 2) -> np.ndarray:
+                         iters: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Per-bin sigma-clipped mean across frames (axis 0) — the same combine
     method used for astronomical master darks: keeps more of the data than
     a plain median (so the result is quieter) while still rejecting
     one-off outlier frames — a transient noise burst during calibration —
     that a plain mean would otherwise bake into the result permanently.
+
+    Also returns the per-bin std and surviving sample count of the final
+    kept set — see _DarkCalibrator._finish, which uses them to gate the
+    correction by statistical significance rather than applying every
+    bin's mean verbatim, however noisy.
     """
     data = frames.astype(np.float64)
     mask = np.ones(data.shape, dtype=bool)
@@ -600,8 +637,12 @@ def _sigma_clipped_mean(frames: np.ndarray, sigma: float = 3.0,
         new_mask = np.abs(data - mean) <= (sigma * std + 1e-12)
         keep = new_mask.sum(axis=0) > 0    # never clip an entire column empty
         mask = np.where(keep, new_mask, mask)
-    n = np.maximum(mask.sum(axis=0), 1)
-    return (data * mask).sum(axis=0) / n
+    # Final mean/std/n from the converged mask.
+    n    = np.maximum(mask.sum(axis=0), 1)
+    mean = (data * mask).sum(axis=0) / n
+    var  = ((data - mean) ** 2 * mask).sum(axis=0) / n
+    std  = np.sqrt(var)
+    return mean, std, n
 
 
 class _DarkCalibrator:
@@ -649,6 +690,17 @@ class _DarkCalibrator:
     The calibration frames are combined with a sigma-clipped mean, not a
     plain average — see _sigma_clipped_mean.
 
+    A bin's sample mean over a short capture also lands off the ~1.0
+    baseline by pure sampling noise even with zero real interference
+    there, so the correction is additionally gated by significance (see
+    _finish): a bin's excess must clear its own standard error by
+    z_thresh before it's allowed to differ from the 1.0 no-op baseline.
+    Without this, ordinary floor bins would each carry a small permanent
+    nudge from whatever scatter happened to occur during that one
+    capture — suppression on the ones that read a little high, and
+    (worse) a standing false amplification on the ones that read a
+    little low, since apply() divides by the master.
+
     Caveat inherited directly from real dark-frame calibration: this only
     helps for interference that's present independent of the target.
     Calibrate with the wrong reference (e.g. the interference only shows
@@ -656,9 +708,24 @@ class _DarkCalibrator:
     not just the noise.
     """
 
-    def __init__(self, n_bins: int, sigma: float = 3.0) -> None:
-        self.n_bins  = int(n_bins)
-        self.sigma   = float(sigma)
+    def __init__(self, n_bins: int, sigma: float = 3.0,
+                 z_thresh: float | None = None) -> None:
+        self.n_bins = int(n_bins)
+        self.sigma  = float(sigma)
+        if z_thresh is None:
+            # Count-aware significance bar (see _finish). Testing n_bins
+            # bins at once means a *flat* z threshold implies a bin-count-
+            # dependent expected number of phantom "interferers" out of
+            # pure noise: at n_bins=2049 (FFT_N=4096), a flat z=3.0 alone
+            # would falsely flag ~5.5 bins per capture on average even with
+            # zero real interference present, purely from running that many
+            # simultaneous tests. sqrt(2 ln n_bins) is the expected maximum
+            # of n_bins i.i.d. standard-normal draws — using it as the bar
+            # keeps the expected false-alarm count roughly flat (~1 across
+            # the whole spectrum) as n_bins changes, instead of growing
+            # with the FFT size. Pass an explicit z_thresh to override.
+            z_thresh = float(np.sqrt(2.0 * np.log(max(self.n_bins, 2))))
+        self.z_thresh = float(z_thresh)   # significance gate, see _finish
         self._capturing = False
         self._frames: list = []
         self._t_start = 0.0
@@ -700,7 +767,7 @@ class _DarkCalibrator:
             self._master = None
             return
         mat = np.stack(frames, axis=0)
-        master = _sigma_clipped_mean(mat, sigma=self.sigma)
+        mean, std, n = _sigma_clipped_mean(mat, sigma=self.sigma)
         # Re-center so an ORDINARY bin's master value is ~1.0 — dividing by
         # it is then a no-op there, and only a bin that was itself elevated
         # relative to the rest of the calibration spectrum gets suppressed.
@@ -711,10 +778,26 @@ class _DarkCalibrator:
         # un-recentered master — whatever its natural bias happens to be —
         # rescales every bin uniformly, background included: exactly the
         # "noise got brighter" failure this recentering exists to prevent.
-        baseline = float(np.median(master))
-        if baseline > 1e-9:
-            master = master / baseline
-        self._master = np.maximum(master, 0.3)   # keep well clear of 0
+        baseline = float(np.median(mean))
+        if baseline <= 1e-9:
+            self._master = None
+            return
+        # Statistical significance gate. A bin's own sample mean over a
+        # short capture lands off `baseline` by some amount from ordinary
+        # frame-to-frame scatter alone, even with zero real interference
+        # there — that's sampling noise, not a physical narrowband source,
+        # and dividing it out anyway is the same "noise got brighter (or
+        # quieter)" failure the recentering above guards against in the
+        # other direction. Only let a bin's correction differ from the 1.0
+        # no-op baseline when its excess clears its own standard error by a
+        # comfortable margin (z_thresh) — the same bar excess_peaks() below
+        # already applies when *reporting* interferers, now applied to what
+        # apply() actually does rather than just what CAL prints.
+        se = np.maximum(std, 1e-6) / np.sqrt(n)
+        z = np.abs(mean - baseline) / se
+        significant = (n >= 4) & (z >= self.z_thresh)
+        ratio = np.where(significant, mean / baseline, 1.0)
+        self._master = np.maximum(ratio, 0.3)   # keep well clear of 0
 
     def clear(self) -> None:
         self._capturing = False
@@ -992,8 +1075,10 @@ class DSPWorker(QObject):
         self._lofar_eigen = _EigenDenoiser(FFT_N // 2 + 1)
         self._demon_eigen = _EigenDenoiser(DEMON_FFT_N // 2 + 1)
 
-        # Dark-frame-style noise calibration — runs on raw mag, before any
-        # NORM mode, so it's independent of (and composes with) NORM/EIGEN.
+        # Dark-frame-style noise calibration — runs on the post-NORM ratio,
+        # before EIGEN sees it (EIGEN can't tell a persistent interferer
+        # from a persistent target line, so CAL has to clean that up
+        # first). Needs a NORM mode other than Off; see _DarkCalibrator.
         self._use_cal = False
         self._cal_pending_enable = False
         self._cal_lofar = _DarkCalibrator(FFT_N // 2 + 1)
