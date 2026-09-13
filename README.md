@@ -7,7 +7,7 @@ This is not submarine software. The techniques inside — LOFAR and DEMON — we
 
 It's for anyone who'd rather see a sound than just hear it: hobbyists tracking drones overhead, engineers listening for a bearing that's about to fail, plane-spotters curious what just flew over, or anyone who wants a real sonar waterfall running on their own laptop. It's one file, no build step, no architecture to learn — it's plain PyQt6 widgets end to end — start to finish, you can read the whole thing in an afternoon if you want to know exactly how it works.
 
-![Sonar Station — LOFAR and DEMON waterfalls](images/sonar_station_2026-09-12_21-20-46.png)
+![Sonar Station — LOFAR and DEMON waterfalls](images/sonar_station_2026-09-14_01-25-00.png)
 
 ---
 
