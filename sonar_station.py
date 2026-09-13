@@ -168,7 +168,7 @@ PCA_RANK   = 4
 PCA_RECALC = 6
 
 # CAL — dark-frame-style noise calibration (see _DarkCalibrator below).
-# Default capture length for a CAL CAPTURE — long enough to average down
+# Default capture length for a CALIBRATE run — long enough to average down
 # random noise in the master spectrum without asking for an unreasonably
 # long "hold still, target absent" period.
 CAL_DURATION_S = 5.0
@@ -1723,7 +1723,7 @@ class DSPWorker(QObject):
                         self._demon_smooth += demon_db
                     demon_pkg = (self._demon_smooth, demon_f_lo, demon_f_hi)
 
-            # A CAL CAPTURE just finished on both streams — start applying
+            # A CALIBRATE run just finished on both streams — start applying
             # whatever master(s) came out of it.
             if self._cal_pending_enable and not self.cal_capturing():
                 self._cal_pending_enable = False
@@ -2519,7 +2519,7 @@ class SonarStation(QMainWindow):
             "No effect when NORM is Off."
         )
         self._chk_eigen.toggled.connect(self._on_eigen)
-        self._btn_cal = QPushButton("CAL CAPTURE")
+        self._btn_cal = QPushButton("CALIBRATE")
         self._btn_cal.setToolTip(
             "Capture a dark-frame-style noise calibration (LOFAR + DEMON)\n"
             f"Hold the mic on target-absent, otherwise-identical conditions\n"
@@ -2534,7 +2534,7 @@ class SonarStation(QMainWindow):
         self._chk_cal = QCheckBox("CAL")
         self._chk_cal.setToolTip(
             "Apply the captured dark-frame noise calibration (LOFAR + DEMON)\n"
-            "Divides the CAL CAPTURE master ratio out of every future\n"
+            "Divides the CALIBRATE master ratio out of every future\n"
             "normalized frame, right after NORM runs. Unlike TPSW/Robust/\n"
             "OS-CFAR/EIGEN — which estimate the floor from the live signal\n"
             "and so can't touch anything that looks like a genuine tonal —\n"
@@ -2542,7 +2542,7 @@ class SonarStation(QMainWindow):
             "self-noise, a fixed fan/HVAC tone) actually measured with the\n"
             "target absent. A bin that sat at the floor during calibration\n"
             "is untouched; only a bin that was itself elevated then gets\n"
-            "pulled back down. Needs a CAL CAPTURE first, and switching\n"
+            "pulled back down. Needs to CALIBRATE first, and switching\n"
             "NORM mode clears it (it's calibrated to that mode's scale).\n"
             "Only helps for interference present independent of your target."
         )
@@ -2654,7 +2654,7 @@ class SonarStation(QMainWindow):
             self._wf_demon.push(arr, f_lo, f_hi)
             self._pending_demon = None
 
-        # CAL CAPTURE countdown / completion — polled rather than
+        # CALIBRATE countdown / completion — polled rather than
         # signaled, same convention as the input-stream liveness check
         # above.
         if self._dsp.cal_capturing():
@@ -2663,7 +2663,7 @@ class SonarStation(QMainWindow):
         elif self._cal_was_capturing:
             self._cal_was_capturing = False
             self._btn_cal.setEnabled(True)
-            self._btn_cal.setText("CAL CAPTURE")
+            self._btn_cal.setText("CALIBRATE")
             armed = self._dsp.cal_armed()
             self._chk_cal.blockSignals(True)
             self._chk_cal.setChecked(armed)
@@ -2677,17 +2677,17 @@ class SonarStation(QMainWindow):
                         for stream, hz, db in peaks
                     )
                     self._status(
-                        f"CAL CAPTURE done — CAL ON  ·  {n} interferer"
+                        f"CALIBRATE done — CAL ON  ·  {n} interferer"
                         f"{'s' if n != 1 else ''} found: {parts}"
                     )
                 else:
                     self._status(
-                        "CAL CAPTURE done — CAL ON, but nothing stood out "
+                        "CALIBRATE done — CAL ON, but nothing stood out "
                         "above the noise (no interference found to remove)"
                     )
             else:
                 self._status(
-                    "CAL CAPTURE failed — not enough frames captured, CAL still OFF"
+                    "CALIBRATE failed — not enough frames captured, CAL still OFF"
                 )
 
     def _screenshot(self) -> None:
@@ -2816,7 +2816,7 @@ class SonarStation(QMainWindow):
         self._chk_cal.blockSignals(False)
         self._btn_cal.setEnabled(False)
         self._status(
-            f"CAL CAPTURE  —  hold target-absent, otherwise-identical "
+            f"CALIBRATE  —  hold target-absent, otherwise-identical "
             f"conditions for {CAL_DURATION_S:g} s…"
         )
 
@@ -2951,10 +2951,7 @@ class SonarStation(QMainWindow):
             self._refresh_devs()
             return
 
-        self._l_src.setText(
-            f"MIC  ·  {dev_name}  ·  {_fmt_khz(self._sr)}"
-            f"  ·  LOFAR {_fmt_khz(self._dsp.lofar_sr)}"
-        )
+        self._l_src.setText(f"MIC  ·  {dev_name}  ·  {_fmt_khz(self._sr)}")
 
         def _cb(indata, frames, _t, _st):
             if not self._playing:

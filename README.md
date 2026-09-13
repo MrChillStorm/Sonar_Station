@@ -92,7 +92,7 @@ See the [Tips](#tips) section below for concrete settings to start from on a few
 | **AUTO LVL checkbox** | Adaptive display levels (keeps tonals bright without washing out) |
 | **SUB checkbox** | DEMON-only background-noise suppression via multi-sub-band coherent averaging |
 | **EIGEN checkbox** | Cross-frame PCA/SVD subspace denoising (LOFAR + DEMON) — sharpens persistent lines, needs NORM on |
-| **CAL CAPTURE button** | Records a few seconds of target-absent audio and builds a dark-frame-style noise calibration |
+| **CALIBRATE button** | Records a few seconds of target-absent audio and builds a dark-frame-style noise calibration |
 | **CAL checkbox** | Apply the captured calibration — removes stable interference (hum, self-noise) the other stages can't touch |
 | **PRESET dropdown** | One-click frequency-scale presets: Drone 0–500 Hz, Drone 0–1 kHz, Ship 0–200 Hz, LOFAR 0–1/2/4/8 kHz, Full (both) |
 | **Color-map dropdown** | Green Phosphor, Night Vision, Amber, Hot, Crimson, Ice, Bone, Copper, Gray, Jet |
@@ -135,7 +135,7 @@ It's a genuine complement to TPSW/Robust/OS-CFAR rather than a replacement — n
 **CAL — dark-frame-style noise calibration**  
 TPSW / Robust / OS-CFAR / EIGEN all estimate the noise floor from the live signal itself — which is exactly why they preserve narrowband tonals; a real target line and a "floor outlier" look the same to a self-referential estimator. CAL is different: it's the audio equivalent of an astronomical dark frame.
 
-Hit **CAL CAPTURE** while the target is absent but everything else is identical (same gain, same mic, same environment, same NORM mode) and it records a few seconds of the *normalized* spectrum (LOFAR and DEMON each have their own), combines those frames with a sigma-clipped mean (the same combine method used for real master darks — it rejects a stray transient during capture without throwing away as much data as a plain median would), and builds a master excess-ratio profile.
+Hit **CALIBRATE** while the target is absent but everything else is identical (same gain, same mic, same environment, same NORM mode) and it records a few seconds of the *normalized* spectrum (LOFAR and DEMON each have their own), combines those frames with a sigma-clipped mean (the same combine method used for real master darks — it rejects a stray transient during capture without throwing away as much data as a plain median would), and builds a master excess-ratio profile.
 
 With **CAL** switched on (it arms itself automatically once capture finishes), that master is divided out of every future frame right after NORM runs — a bin that sat at the floor during calibration is re-centered to a master of ~1.0 so nothing happens to it, while a bin that was itself elevated then gets pulled back down. The re-centering step matters: a normalizer's own "typical" output isn't necessarily 1.0 (OS-CFAR at its default rank, for instance, puts most ordinary bins measurably *below* 1.0 by construction), so without it, dividing by the raw master would rescale every bin uniformly — background included — which is the "noise got brighter" failure mode this step exists to prevent.
 
@@ -192,7 +192,7 @@ When you scroll to zoom into a narrow frequency range, the app automatically gro
 - **Aircraft at distance**: a directional mic improves SNR dramatically. Enable ALE to whiten wind noise before the FFT.
 - **Multiple mics**: if you have a matched stereo pair both aimed at the same source, the mono downmix averages two uncorrelated noise floors while the on-axis signal adds coherently — a genuine ~3 dB SNR improvement. A single mic in one channel of a two-channel interface gives you nothing extra; the empty channel contributes only noise to the average.
 - **Factory machinery**: mount an accelerometer with a contact-mic adapter on a bearing housing. The LOFAR waterfall will show the bearing characteristic frequencies as steady horizontal lines; defect sidebands appear symmetrically around the shaft-rate harmonic.
-- **Persistent hum or a fixed background tone** (mains hum, a ground loop, an always-on fan/HVAC drone): before your target shows up, hit **CAL CAPTURE** and hold still for the countdown — it needs the target absent and everything else exactly as it will be during real monitoring (same gain, same environment). That's the one stage here that can remove a stable, tonal-looking interferer the other normalizers are specifically designed to preserve.
+- **Persistent hum or a fixed background tone** (mains hum, a ground loop, an always-on fan/HVAC drone): before your target shows up, hit **CALIBRATE** and hold still for the countdown — it needs the target absent and everything else exactly as it will be during real monitoring (same gain, same environment). That's the one stage here that can remove a stable, tonal-looking interferer the other normalizers are specifically designed to preserve.
 
 ---
 
