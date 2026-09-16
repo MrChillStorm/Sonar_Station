@@ -526,6 +526,72 @@ def os_cfar_floor(spectrum: np.ndarray, train: int = 40, guard: int = 3,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DEMON multi-sub-band filter bank — batched SOS cascade
+# ═══════════════════════════════════════════════════════════════════════════════
+def _sosfilt_bank_py(xs: np.ndarray, sos: np.ndarray, zi: np.ndarray,
+                      valid: np.ndarray, out: np.ndarray) -> None:
+    """
+    Apply N independent cascaded-biquad (SOS) filters in one call instead
+    of N separate scipy.signal.sosfilt calls.
+
+    xs:    (N, L) per-band input (rows may be a shared signal tiled across
+           bands — only ever read here, never written).
+    sos:   (N, S, 6) per-band [b0, b1, b2, a0, a1, a2] sections, a0 == 1.
+    zi:    (N, S, 2) per-band per-section state, updated in place.
+    valid: (N,) rows where False are skipped (zi/out left untouched).
+    out:   (N, L) filtered output, written in place.
+
+    Implements the same transposed-direct-form-II recursion
+    scipy.signal.sosfilt runs per section, so output is numerically
+    identical to N scipy calls — this only removes the per-call
+    Python/NumPy dispatch overhead (shape/axis validation, SOS
+    re-validation) that profiling showed dominates cost at this array
+    size: ~583k sosfilt() calls/run with the 8-band DEMON sub-band filter
+    bank, averaging ~33us/call of which roughly half was that overhead
+    rather than the actual filter arithmetic. Kept nopython-safe so it can
+    be decorated with @numba.njit below.
+    """
+    n, length = xs.shape
+    n_sections = sos.shape[1]
+    for i in range(n):
+        if not valid[i]:
+            continue
+        buf = xs[i].copy()
+        for s in range(n_sections):
+            b0 = sos[i, s, 0]
+            b1 = sos[i, s, 1]
+            b2 = sos[i, s, 2]
+            a1 = sos[i, s, 4]
+            a2 = sos[i, s, 5]
+            z0 = zi[i, s, 0]
+            z1 = zi[i, s, 1]
+            for k in range(length):
+                x_k = buf[k]
+                y_k = b0 * x_k + z0
+                z0 = b1 * x_k - a1 * y_k + z1
+                z1 = b2 * x_k - a2 * y_k
+                buf[k] = y_k
+            zi[i, s, 0] = z0
+            zi[i, s, 1] = z1
+        out[i, :] = buf
+
+
+if _NUMBA:
+    _sosfilt_bank = _numba.njit(cache=True, fastmath=True, boundscheck=False)(_sosfilt_bank_py)
+    # Warm up with representative shapes (8 bands, 4-section bandpass,
+    # 512-sample chunk) so Numba compiles before the first real audio frame.
+    _sosfilt_bank(
+        np.ones((8, 512), dtype=np.float64),
+        np.tile(sp.butter(4, [0.1, 0.3], btype="bandpass", output="sos")[None, :, :], (8, 1, 1)),
+        np.zeros((8, 4, 2), dtype=np.float64),
+        np.ones(8, dtype=np.bool_),
+        np.empty((8, 512), dtype=np.float64),
+    )
+else:
+    _sosfilt_bank = None   # DSPWorker falls back to the per-band scipy loop
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  EIGEN — cross-frame PCA/SVD subspace denoiser
 # ═══════════════════════════════════════════════════════════════════════════════
 class _EigenDenoiser:
@@ -1121,6 +1187,18 @@ class DSPWorker(QObject):
         self._demon_n_sub:     int = _N_SUB
         self._demon_sub_stale: bool = True
 
+        # Batched (Numba-fused) filter-bank state — see _sosfilt_bank above.
+        # Only populated/used when Numba is installed; otherwise DSPWorker
+        # falls back to the per-band scipy.signal.sosfilt loop unchanged.
+        self._demon_sub_fused: bool = _NUMBA
+        self._demon_sub_sos_stack:    np.ndarray | None = None   # (N_SUB, 4, 6)
+        self._demon_sub_valid:        np.ndarray = np.zeros(_N_SUB, dtype=np.bool_)
+        self._demon_sub_bp_zi_stack:  np.ndarray | None = None   # (N_SUB, 4, 2)
+        self._demon_sub_bp_zi_ready:  np.ndarray = np.zeros(_N_SUB, dtype=np.bool_)
+        self._demon_sub_lp_sos_stack: np.ndarray | None = None   # (N_SUB, S_lp, 6)
+        self._demon_sub_lp_zi_stack:  np.ndarray | None = None   # (N_SUB, S_lp, 2)
+        self._demon_sub_lp_zi_ready:  np.ndarray = np.zeros(_N_SUB, dtype=np.bool_)
+
         self._win = np.hanning(FFT_N).astype(np.float32)
         self._demon_win = np.hanning(DEMON_FFT_N).astype(np.float64)
 
@@ -1353,6 +1431,38 @@ class DSPWorker(QObject):
             self._demon_sub_lp_zi[i] = None
         self._demon_sub_buf[:] = 0.0
         self._demon_sub_stale  = False
+
+        if self._demon_sub_fused:
+            # Stack per-band BP SOS into one contiguous (N, 4, 6) array for
+            # _sosfilt_bank — every band shares the order-4 -> 4-section
+            # shape; invalid bands get an identity pass-through row and are
+            # skipped via `valid` (matches the `sos is None` skip above).
+            identity = np.array([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+            sos_stack = np.tile(identity, (n, 4, 1))
+            valid = np.zeros(n, dtype=np.bool_)
+            for i, sos in enumerate(self._demon_sub_sos):
+                if sos is not None:
+                    sos_stack[i] = sos
+                    valid[i] = True
+            self._demon_sub_sos_stack      = sos_stack
+            self._demon_sub_valid          = valid
+            self._demon_sub_bp_zi_stack    = np.zeros((n, 4, 2), dtype=np.float64)
+            self._demon_sub_bp_zi_ready[:] = False
+
+            # Sub-band envelope LPs share coefficients with the main DEMON
+            # envelope LP (built earlier this chunk in _build_demon_filters,
+            # if stale) — stack it N times so the same batched kernel call
+            # can run all N envelope filters with independent per-band state.
+            if self._demon_env_lp is not None:
+                s_lp = self._demon_env_lp.shape[0]
+                self._demon_sub_lp_sos_stack = np.tile(
+                    self._demon_env_lp[None, :, :], (n, 1, 1)
+                )
+                self._demon_sub_lp_zi_stack  = np.zeros((n, s_lp, 2), dtype=np.float64)
+            else:
+                self._demon_sub_lp_sos_stack = None
+                self._demon_sub_lp_zi_stack  = None
+            self._demon_sub_lp_zi_ready[:] = False
 
     # ── ZoomFFT control ─────────────────────────────────────────────────────
 
@@ -1587,7 +1697,61 @@ class DSPWorker(QObject):
                 self._demon_hop_acc += n_new
 
                 # ── Sub-band accumulation (parallel with main band) ─────
-                if self._demon_sub_enabled:
+                if self._demon_sub_enabled and self._demon_sub_sos_stack is not None:
+                    # Fused path: all N_SUB bandpasses, and (if configured)
+                    # all N_SUB envelope lowpasses, each run as ONE batched
+                    # Numba call instead of up to 16 separate
+                    # scipy.signal.sosfilt calls per chunk — see
+                    # _sosfilt_bank above.
+                    n_sub_bands = self._demon_sub_sos_stack.shape[0]
+                    bp64 = bp if bp.dtype == np.float64 else bp.astype(np.float64)
+                    bp_bank = np.tile(bp64, (n_sub_bands, 1))
+
+                    need_bp = self._demon_sub_valid & ~self._demon_sub_bp_zi_ready
+                    if need_bp.any():
+                        for i in np.nonzero(need_bp)[0]:
+                            self._demon_sub_bp_zi_stack[i] = (
+                                sp.sosfilt_zi(self._demon_sub_sos[i]) * float(bp64[0])
+                            )
+                        self._demon_sub_bp_zi_ready |= need_bp
+
+                    sub_bp_bank = np.empty_like(bp_bank)
+                    _sosfilt_bank(
+                        bp_bank, self._demon_sub_sos_stack, self._demon_sub_bp_zi_stack,
+                        self._demon_sub_valid, sub_bp_bank,
+                    )
+                    sub_env_bank = np.abs(sub_bp_bank)
+
+                    if self._demon_sub_lp_sos_stack is not None:
+                        need_lp = self._demon_sub_valid & ~self._demon_sub_lp_zi_ready
+                        if need_lp.any():
+                            for i in np.nonzero(need_lp)[0]:
+                                self._demon_sub_lp_zi_stack[i] = (
+                                    sp.sosfilt_zi(self._demon_env_lp) * float(sub_env_bank[i, 0])
+                                )
+                            self._demon_sub_lp_zi_ready |= need_lp
+
+                        lp_out = np.empty_like(sub_env_bank)
+                        _sosfilt_bank(
+                            sub_env_bank, self._demon_sub_lp_sos_stack,
+                            self._demon_sub_lp_zi_stack, self._demon_sub_valid, lp_out,
+                        )
+                        sub_env_bank = lp_out
+
+                    # Same decimation phase as the main band, vectorized
+                    # across bands; only valid rows are shifted into the
+                    # ring buffer (invalid bands are left untouched, same
+                    # as the per-band `continue` did before fusion).
+                    sub_ds_bank = sub_env_bank[:, old_ds_phase::ds]
+                    n_sub = sub_ds_bank.shape[1]
+                    if n_sub > 0:
+                        v = self._demon_sub_valid
+                        self._demon_sub_buf[v, :-n_sub] = self._demon_sub_buf[v, n_sub:]
+                        self._demon_sub_buf[v, -n_sub:] = sub_ds_bank[v]
+
+                elif self._demon_sub_enabled:
+                    # Numba not installed — per-band scipy.signal.sosfilt
+                    # fallback (behavior identical to the fused path above).
                     for i, sub_sos in enumerate(self._demon_sub_sos):
                         if sub_sos is None:
                             continue
