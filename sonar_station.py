@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sys
 import gc
+import math
 import time
 import queue
 import threading
@@ -72,6 +73,56 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QRect, QSize
 from PyQt6.QtGui import QAction, QColor, QFontMetrics, QPainter
 import pyqtgraph as pg
+
+
+def _patch_pyqtgraph_qimage_overflow() -> None:
+    """
+    Work around a PyQt6/SIP overload-resolution quirk in pyqtgraph's
+    ndarray_to_qimage() (pyqtgraph/functions.py): on the PyQt branch it
+    casts the array's sip.voidptr to a plain Python int before handing it
+    to QImage(ptr, w, h, bytesPerLine, fmt). That plain int is ambiguous
+    across QImage's overloaded constructors, so SIP probes a candidate
+    overload that treats it as a C `int` argument, which raises (and
+    internally discards) an OverflowError -- confirmed via a 30-call
+    isolated repro: 30/30 calls each left one new OverflowError alive for
+    the next GC sweep to reap, on every single waterfall repaint.
+
+    Passing the sip.voidptr object directly (skipping the int() cast)
+    resolves the intended non-const uchar* overload with no failed
+    attempt, and produces byte-identical QImage output for the same
+    input array (verified separately). This patches just that one
+    function at runtime rather than vendoring a fork, and is fully
+    best-effort: any failure (a pyqtgraph internals change, a different
+    Qt binding, etc.) leaves pyqtgraph's own slightly-wasteful-but-correct
+    version in place instead of risking broken rendering.
+    """
+    try:
+        import pyqtgraph.functions as _pgfn
+        import pyqtgraph.Qt as _pgqt
+        from pyqtgraph.Qt import QtGui as _QtGui, QT_LIB as _QT_LIB
+
+        if not _QT_LIB.startswith("PyQt"):
+            return   # only the PyQt binding takes the int()-cast detour
+
+        def _ndarray_to_qimage_no_overflow(arr, fmt):
+            img_ptr = _pgqt.sip.voidptr(arr)   # was: int(_pgqt.sip.voidptr(arr))
+            h, w = arr.shape[:2]
+            bytesPerLine = arr.strides[0]
+            qimg = _QtGui.QImage(img_ptr, w, h, bytesPerLine, fmt)
+            qimg.data = arr
+            return qimg
+
+        # Prove the replacement actually works on this pyqtgraph/PyQt6
+        # combination before installing it.
+        _probe = np.zeros((2, 2, 4), dtype=np.ubyte)
+        _ndarray_to_qimage_no_overflow(_probe, _QtGui.QImage.Format.Format_ARGB32)
+
+        _pgfn.ndarray_to_qimage = _ndarray_to_qimage_no_overflow
+    except Exception:
+        pass   # leave pyqtgraph's original implementation in place
+
+
+_patch_pyqtgraph_qimage_overflow()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1979,6 +2030,16 @@ class Waterfall(pg.PlotWidget):
     band_nudge   = pyqtSignal(float, float)  # retained for API compat
     zoom_changed = pyqtSignal(float, float)  # emitted on every zoom/pan/reset
 
+    # Shared by every Waterfall instance (LOFAR + DEMON) rather than one
+    # independent QTimer per instance. Two independently-phased 60Hz
+    # timers on the same single-threaded GUI event loop can land back to
+    # back and delay each other — measured: LOFAR's repaint-interval CV
+    # dropped from ~37% to ~33% across repeated trials with DEMON's timer
+    # stopped, confirming real contention. One shared timer's timeout
+    # dispatches to every connected _repaint_tick in the same event-loop
+    # pass instead of two separately-scheduled ones competing.
+    _shared_repaint_timer: QTimer | None = None
+
     def __init__(self, title: str = "", sr: int = SR_DEF,
                  fft_n: int = FFT_N, history: int = HISTORY,
                  f_lo: float = DISP_LO, f_hi: float = DISP_HI,
@@ -2000,22 +2061,16 @@ class Waterfall(pg.PlotWidget):
         self._rows_written = 0                     # actual rows pushed so far
         self._view_offset = 0                      # 0 = live; >0 = rows back in time
         self._rect   = (0.0, float(self._freqs[-1]))  # (f_lo, f_hi) of last push
+        # Auto-play position, tracked separately from _rows_written (which
+        # saturates once the scroll buffer fills) — see _repaint_tick.
+        self._total_pushed = 0                      # uncapped row counter
+        self._play_cursor  = 0                       # rows the display has caught up to
+        self._behind_ema   = 1.0                     # adaptive per-tick step size — see _repaint_tick
         self._drag_x: float | None = None         # left-button drag origin (pixels)
 
         self._auto_levels = False
         self._fixed_levels = (-10.0, 25.0)
         self._level_counter = 0          # recompute percentiles every N frames
-
-        # Cap the actual repaint (render + setImage) rate independently of
-        # how fast rows arrive. Incoming rows (~94Hz for LOFAR) always get
-        # written into the scroll buffer below regardless of this cap, so
-        # no data is lost — this only limits how often the image is
-        # rebuilt and handed to Qt, which is more than any display can
-        # show anyway and is the expensive part of push() (ImageItem's
-        # QImage construction, one extra GC-tracked object per call).
-        self._min_render_interval = 1.0 / 60.0
-        self._last_render_t = 0.0
-
 
         self._img = pg.ImageItem()
         self._img.setAutoDownsample(True)   # skip rescaling sub-pixel columns
@@ -2044,6 +2099,23 @@ class Waterfall(pg.PlotWidget):
         self.addItem(self._title_item)
 
         self.viewport().installEventFilter(self)
+
+        # The actual repaint (render + setImage) runs on the shared
+        # fixed-rate timer (see _shared_repaint_timer above), decoupled
+        # from how often rows arrive via push(). Gating it on "has enough
+        # time passed since the last render?" checked only at each push()
+        # (its own ~10-12ms cadence) snapped unevenly between firing after
+        # 1 vs 2 arrivals, since that cadence isn't a clean multiple of a
+        # 60Hz interval — its own source of jitter. A shared timer paints
+        # every Waterfall on the same steady clock no matter how push()
+        # timing wobbles; push() itself now only ever writes into the
+        # scroll buffer, so no row is ever dropped regardless of repaint
+        # timing.
+        if Waterfall._shared_repaint_timer is None:
+            Waterfall._shared_repaint_timer = QTimer()
+            Waterfall._shared_repaint_timer.setInterval(int(1000 / 60))
+            Waterfall._shared_repaint_timer.start()
+        Waterfall._shared_repaint_timer.timeout.connect(self._repaint_tick)
 
     def eventFilter(self, src, ev):
         if src is self.viewport():
@@ -2126,7 +2198,11 @@ class Waterfall(pg.PlotWidget):
     def push(self, spec_db: np.ndarray, f_lo: float = 0.0, f_hi: float = None) -> None:
         """Push one spectrum row.  f_lo/f_hi describe the frequency extent of
         spec_db so the image rect is kept in sync with both full-range (standard
-        FFT) and zoomed (ZoomFFT) spectra."""
+        FFT) and zoomed (ZoomFFT) spectra.
+
+        Only records the row — the actual repaint runs on its own fixed-rate
+        timer (_repaint_tick), so every row lands in the scroll buffer
+        regardless of how often the display itself gets rebuilt."""
         if f_hi is None:
             f_hi = float(self._freqs[-1])
         # Circular write into the full scroll buffer — always, even when paused.
@@ -2137,15 +2213,49 @@ class Waterfall(pg.PlotWidget):
         if n < self._nbins:
             self._buf[self._head, n:] = 0.0
         self._rect = (f_lo, f_hi)
+        self._total_pushed += 1
+
+    def _repaint_tick(self) -> None:
+        """Fixed-rate repaint (see the shared _repaint_timer set up in __init__).
+        Advances the displayed row by a small, adaptively-sized step each
+        tick rather than jumping straight to whatever's currently newest.
+
+        Rendering "whatever's currently newest" every tick meant roughly
+        1 repaint in 4 jumped by 2 rows instead of 1 -- statistically more
+        regular timing, but a visibly uneven scroll step, which turned
+        out to matter more than raw timing jitter.
+
+        The step size (_behind_ema) is measured at runtime, not a
+        hardcoded rate: live mic capture is always AUDIO_SR (see
+        _on_mic_toggled), but a loaded WAV file pushes at whatever sample
+        rate the file itself has, and DEMON rows arrive far slower than
+        LOFAR (hop-gated, no fixed relationship to the audio rate either)
+        -- there's no single constant that's correct for every case. An
+        EMA of the observed backlog converges to whatever step size is
+        actually needed to avoid drifting behind, for both waterfalls,
+        under any source rate, without needing to know it in advance.
+
+        If far behind (e.g. the widget was hidden or the view was
+        scrolled back for a while), snaps forward to the oldest row still
+        retained in the buffer instead of animating through the whole
+        backlog a few rows at a time."""
         if self.height() < 8 or self._view_offset != 0:
-            return   # paused — buffer updated but display frozen
-
-        now = time.perf_counter()
-        if now - self._last_render_t < self._min_render_interval:
-            return   # buffer already up to date; skip this frame's repaint
-        self._last_render_t = now
-
-        self._render_at(0)
+            return   # hidden or scrolled back — buffer is current, display isn't
+        behind = self._total_pushed - self._play_cursor
+        if behind <= 0:
+            self._behind_ema *= 0.98   # decay slowly so a brief lull doesn't discard the learned rate
+            return
+        max_lag = self.scroll_max
+        if behind > max_lag:
+            self._play_cursor = self._total_pushed - max_lag   # snap: too far behind to catch up smoothly
+            self._behind_ema = 0.0
+        else:
+            self._behind_ema = 0.98 * self._behind_ema + 0.02 * behind
+            step = max(1, math.ceil(self._behind_ema))
+            self._play_cursor += min(behind, step)
+        lag = self._total_pushed - self._play_cursor
+        f_lo, f_hi = self._rect
+        self._render_at(lag)
         self._img.setRect(pg.QtCore.QRectF(f_lo, 0.0, f_hi - f_lo, float(self._history)))
         self._img.setImage(self._render.T, autoLevels=False)
 
@@ -2183,6 +2293,11 @@ class Waterfall(pg.PlotWidget):
     def scroll_to(self, offset: int) -> None:
         """Show history at `offset` rows back from newest.  0 resumes live."""
         self._view_offset = max(0, min(offset, self.scroll_max))
+        if self._view_offset == 0:
+            # Resuming live here renders the true newest row directly
+            # (below); sync the auto-play cursor to match so the very next
+            # _repaint_tick doesn't think it's still behind and jump back.
+            self._play_cursor = self._total_pushed
         if self.height() < 8:
             return
         self._render_at(self._view_offset)
@@ -2668,6 +2783,17 @@ class SonarStation(QMainWindow):
         )
         self._norm_box.currentIndexChanged.connect(self._on_norm)
         self._chk_ale = QCheckBox("ALE")
+        self._chk_ale.setToolTip(
+            "Adaptive Line Enhancer (DEMON only)\n"
+            "Frequency-domain NLMS filter: a delayed copy of the signal is\n"
+            "used to predict the raw one, which decorrelates broadband noise\n"
+            "while narrow, persistent tonals (shaft/blade-rate lines) stay\n"
+            "predictable and get reinforced. Output blends 75% enhanced\n"
+            "signal with 25% original so broadband context isn't lost.\n"
+            "Only feeds DEMON's bandpass/envelope path — LOFAR always reads\n"
+            "the raw signal, so the adaptive filter's own spectral coloring\n"
+            "doesn't paint vertical stripes on the LOFAR waterfall."
+        )
         self._chk_ale.toggled.connect(self._on_ale)
         self._chk_auto = QCheckBox("AUTO LVL")
         self._chk_auto.setToolTip(
