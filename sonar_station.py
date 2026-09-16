@@ -2006,6 +2006,16 @@ class Waterfall(pg.PlotWidget):
         self._fixed_levels = (-10.0, 25.0)
         self._level_counter = 0          # recompute percentiles every N frames
 
+        # Cap the actual repaint (render + setImage) rate independently of
+        # how fast rows arrive. Incoming rows (~94Hz for LOFAR) always get
+        # written into the scroll buffer below regardless of this cap, so
+        # no data is lost — this only limits how often the image is
+        # rebuilt and handed to Qt, which is more than any display can
+        # show anyway and is the expensive part of push() (ImageItem's
+        # QImage construction, one extra GC-tracked object per call).
+        self._min_render_interval = 1.0 / 60.0
+        self._last_render_t = 0.0
+
 
         self._img = pg.ImageItem()
         self._img.setAutoDownsample(True)   # skip rescaling sub-pixel columns
@@ -2129,6 +2139,12 @@ class Waterfall(pg.PlotWidget):
         self._rect = (f_lo, f_hi)
         if self.height() < 8 or self._view_offset != 0:
             return   # paused — buffer updated but display frozen
+
+        now = time.perf_counter()
+        if now - self._last_render_t < self._min_render_interval:
+            return   # buffer already up to date; skip this frame's repaint
+        self._last_render_t = now
+
         self._render_at(0)
         self._img.setRect(pg.QtCore.QRectF(f_lo, 0.0, f_hi - f_lo, float(self._history)))
         self._img.setImage(self._render.T, autoLevels=False)
