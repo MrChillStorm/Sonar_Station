@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import sys
+import gc
 import time
 import queue
 import threading
@@ -3228,6 +3229,27 @@ def main() -> None:
     app.setStyle("Fusion")
     win = SonarStation()
     win.show()
+
+    # The window + DSP-thread object graph (widgets, Qt signal/slot
+    # connections like spectrum_ready -> _recv_spec) is now fully built.
+    # Those connections are mutual references — real reference cycles —
+    # but they're created once here, not accumulated per audio chunk or
+    # GUI tick. gc.freeze() exempts this static baseline from future
+    # cyclic-GC scans; disabling automatic collection then removes the
+    # unpredictable pause a gen0/1/2 sweep can cause mid-chunk in the DSP
+    # thread (GC is process-global under the GIL, so a sweep triggered by
+    # any thread's allocations can preempt any other thread). The 60s
+    # manual gc.collect() is a safety net against any cycles that *do*
+    # accumulate at runtime, so a long-running session can't leak memory
+    # unbounded — it only has to scan objects created since the freeze.
+    gc.collect()
+    gc.freeze()
+    gc.disable()
+    win._gc_timer = QTimer()
+    win._gc_timer.setInterval(60_000)
+    win._gc_timer.timeout.connect(gc.collect)
+    win._gc_timer.start()
+
     sys.exit(app.exec())
 
 
